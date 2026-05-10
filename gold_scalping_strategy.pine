@@ -1,0 +1,105 @@
+//@version=5
+strategy(
+     title            = "Gold Scalping Strategy (XAUUSD)",
+     overlay          = true,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value= 5,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.07,
+     slippage         = 3
+ )
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+ema_fast_len = input.int(9,  "EMA Fast",        group="Moving Averages")
+ema_slow_len = input.int(21, "EMA Slow",        group="Moving Averages")
+rsi_len      = input.int(14, "RSI Length",      group="RSI")
+rsi_ob       = input.int(70, "RSI Overbought",  group="RSI")
+rsi_os       = input.int(30, "RSI Oversold",    group="RSI")
+atr_len      = input.int(14, "ATR Length",      group="Risk Management")
+atr_sl_mult  = input.float(1.0, "Stop Loss ATR Multiplier",  step=0.1, group="Risk Management")
+atr_tp_mult  = input.float(2.0, "Take Profit ATR Multiplier", step=0.1, group="Risk Management")
+bb_len       = input.int(20, "BB Length",       group="Bollinger Bands")
+bb_mult      = input.float(2.0, "BB StdDev",   step=0.1, group="Bollinger Bands")
+
+// ─── SESSION FILTER (London + New York) ───────────────────────────────────────
+london_session   = time(timeframe.period, "0800-1200", "GMT+0")
+newyork_session  = time(timeframe.period, "1300-1700", "GMT+0")
+in_session       = not na(london_session) or not na(newyork_session)
+
+// ─── INDICATORS ───────────────────────────────────────────────────────────────
+ema_fast = ta.ema(close, ema_fast_len)
+ema_slow = ta.ema(close, ema_slow_len)
+rsi      = ta.rsi(close, rsi_len)
+atr      = ta.atr(atr_len)
+
+[bb_mid, bb_upper, bb_lower] = ta.bb(close, bb_len, bb_mult)
+
+// ─── CONDITIONS ───────────────────────────────────────────────────────────────
+ema_bull = ema_fast > ema_slow
+ema_bear = ema_fast < ema_slow
+
+ema_cross_up   = ta.crossover(ema_fast, ema_slow)
+ema_cross_down = ta.crossunder(ema_fast, ema_slow)
+
+rsi_neutral = rsi > rsi_os and rsi < rsi_ob
+
+price_above_bb_mid = close > bb_mid
+price_below_bb_mid = close < bb_mid
+
+long_condition  = ema_cross_up   and rsi_neutral and price_above_bb_mid and in_session
+short_condition = ema_cross_down and rsi_neutral and price_below_bb_mid and in_session
+
+// ─── STRATEGY ENTRIES & EXITS ─────────────────────────────────────────────────
+if long_condition
+    sl_price = close - atr * atr_sl_mult
+    tp_price = close + atr * atr_tp_mult
+    strategy.entry("Long", strategy.long, comment="BUY")
+    strategy.exit("Exit Long", "Long", stop=sl_price, limit=tp_price)
+
+if short_condition
+    sl_price = close + atr * atr_sl_mult
+    tp_price = close - atr * atr_tp_mult
+    strategy.entry("Short", strategy.short, comment="SELL")
+    strategy.exit("Exit Short", "Short", stop=sl_price, limit=tp_price)
+
+// ─── PLOTS ────────────────────────────────────────────────────────────────────
+plot(ema_fast, title="EMA 9",  color=color.new(color.blue,   0), linewidth=2)
+plot(ema_slow, title="EMA 21", color=color.new(color.orange, 0), linewidth=2)
+plot(bb_upper, title="BB Upper", color=color.new(color.gray, 40), linewidth=1)
+plot(bb_mid,   title="BB Mid",   color=color.new(color.gray, 20), linewidth=1, style=plot.style_circles)
+plot(bb_lower, title="BB Lower", color=color.new(color.gray, 40), linewidth=1)
+
+// ─── SIGNALS ──────────────────────────────────────────────────────────────────
+plotshape(long_condition,  title="BUY Signal",  style=shape.labelup,
+          location=location.belowbar, color=color.new(color.green, 0),
+          textcolor=color.white, text="BUY",  size=size.normal)
+
+plotshape(short_condition, title="SELL Signal", style=shape.labeldown,
+          location=location.abovebar, color=color.new(color.red, 0),
+          textcolor=color.white, text="SELL", size=size.normal)
+
+// ─── BACKGROUND (active session) ──────────────────────────────────────────────
+bgcolor(in_session ? color.new(color.yellow, 93) : na, title="Trading Session")
+
+// ─── INFO TABLE ───────────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 6,
+     bgcolor       = color.new(color.black, 80),
+     border_color  = color.new(color.white, 60),
+     border_width  = 1)
+
+if barstate.islast
+    table.cell(info, 0, 0, "Indicator",  text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 0, "Value",      text_color=color.silver, text_size=size.small)
+    table.cell(info, 0, 1, "EMA Fast",   text_color=color.white,  text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(ema_fast, "#.##"), text_color=color.blue, text_size=size.small)
+    table.cell(info, 0, 2, "EMA Slow",   text_color=color.white,  text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(ema_slow, "#.##"), text_color=color.orange, text_size=size.small)
+    table.cell(info, 0, 3, "RSI",        text_color=color.white,  text_size=size.small)
+    rsi_col = rsi > rsi_ob ? color.red : rsi < rsi_os ? color.green : color.yellow
+    table.cell(info, 1, 3, str.tostring(rsi, "#.##"), text_color=rsi_col, text_size=size.small)
+    table.cell(info, 0, 4, "ATR",        text_color=color.white,  text_size=size.small)
+    table.cell(info, 1, 4, str.tostring(atr, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 5, "Session",    text_color=color.white,  text_size=size.small)
+    sess_col = in_session ? color.green : color.red
+    sess_txt = in_session ? "ACTIVE" : "CLOSED"
+    table.cell(info, 1, 5, sess_txt, text_color=sess_col, text_size=size.small)

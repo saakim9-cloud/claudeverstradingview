@@ -1,0 +1,168 @@
+//@version=5
+indicator(
+     title            = "Market Structure — BOS & CHoCH",
+     shorttitle       = "BOS / CHoCH",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_labels_count = 500
+ )
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Smart Money market structure.
+//
+//  Swing highs/lows are confirmed with a pivot lookback. When price takes out the
+//  last unbroken swing level, the break is classified:
+//
+//    BOS   (Break of Structure)  — the break continues the current trend.
+//    CHoCH (Change of Character) — the break goes against the current trend and
+//                                  flips it. This is the first sign of reversal.
+//
+//  Two independent structure streams are tracked: a longer "swing" structure for
+//  the dominant trend, and a shorter "internal" structure for the moves inside it.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+g_swing = "Swing Structure"
+show_swing    = input.bool(true, "Show Swing Structure",  group=g_swing)
+swing_len     = input.int(10, "Swing Pivot Length", minval=1, group=g_swing,
+     tooltip="Bars required on each side of a pivot before it is confirmed. Higher = fewer, more significant structure points.")
+
+g_int = "Internal Structure"
+show_internal = input.bool(false, "Show Internal Structure", group=g_int)
+internal_len  = input.int(3, "Internal Pivot Length", minval=1, group=g_int,
+     tooltip="Shorter pivot length for the minor structure inside each swing leg.")
+
+g_conf = "Confirmation"
+break_src = input.string("Close", "Break Confirmation", options=["Close", "Wick"], group=g_conf,
+     tooltip="Close = a candle must close beyond the level (stricter, fewer false breaks). Wick = any trade beyond the level counts.")
+
+g_style = "Style"
+bull_col   = input.color(color.new(#26a69a, 0), "Bullish Break", group=g_style)
+bear_col   = input.color(color.new(#ef5350, 0), "Bearish Break", group=g_style)
+line_style = input.string("Solid", "Structure Line", options=["Solid", "Dashed", "Dotted"], group=g_style)
+label_size = input.string("Small", "Label Size", options=["Tiny", "Small", "Normal"], group=g_style)
+show_levels= input.bool(true, "Show Pending Swing Levels", group=g_style,
+     tooltip="Plots the live swing high/low that price has not taken out yet.")
+color_bars = input.bool(false, "Color Bars By Structure Trend", group=g_style)
+
+// ─── STYLE RESOLUTION ─────────────────────────────────────────────────────────
+ln_style = line_style == "Dashed" ? line.style_dashed : line_style == "Dotted" ? line.style_dotted : line.style_solid
+lbl_size = label_size == "Tiny"   ? size.tiny         : label_size == "Normal" ? size.normal        : size.small
+
+// ─── STRUCTURE STATE ──────────────────────────────────────────────────────────
+type Structure
+    float top       = na    // last confirmed swing high
+    int   top_bar   = na    // bar index of that swing high
+    bool  top_taken = true  // has it already been broken?
+    float btm       = na    // last confirmed swing low
+    int   btm_bar   = na
+    bool  btm_taken = true
+    int   trend     = 0     // 1 = bullish, -1 = bearish, 0 = undefined
+
+// Tests the pending swing levels for a break, classifies it, then registers any
+// newly confirmed pivot. Break is checked BEFORE the pivot update so a pivot that
+// confirms on the same bar cannot swallow the break of the previous level.
+f_update(Structure s, float ph, float pl, int len, float up_src, float dn_src) =>
+    broken_top     = s.top
+    broken_top_bar = s.top_bar
+    broken_btm     = s.btm
+    broken_btm_bar = s.btm_bar
+
+    bull_break = not na(s.top) and not s.top_taken and up_src > s.top
+    bear_break = not na(s.btm) and not s.btm_taken and dn_src < s.btm
+
+    bull_bos   = false
+    bull_choch = false
+    bear_bos   = false
+    bear_choch = false
+
+    if bull_break
+        s.top_taken := true
+        if s.trend == -1
+            bull_choch := true
+        else
+            bull_bos := true
+        s.trend := 1
+
+    if bear_break
+        s.btm_taken := true
+        if s.trend == 1
+            bear_choch := true
+        else
+            bear_bos := true
+        s.trend := -1
+
+    if not na(ph)
+        s.top       := ph
+        s.top_bar   := bar_index - len
+        s.top_taken := false
+
+    if not na(pl)
+        s.btm       := pl
+        s.btm_bar   := bar_index - len
+        s.btm_taken := false
+
+    [bull_bos, bull_choch, bear_bos, bear_choch, broken_top, broken_top_bar, broken_btm, broken_btm_bar]
+
+// Draws the horizontal level that was taken out, plus its BOS / CHoCH tag.
+f_draw(float lvl, int from_bar, string txt, color col, bool bullish, int width) =>
+    if not na(lvl) and not na(from_bar)
+        line.new(from_bar, lvl, bar_index, lvl, color=col, width=width, style=ln_style)
+        label.new(
+             x         = int(math.avg(from_bar, bar_index)),
+             y         = lvl,
+             text      = txt,
+             color     = color.new(color.black, 100),
+             textcolor = col,
+             style     = bullish ? label.style_label_down : label.style_label_up,
+             size      = lbl_size)
+
+// ─── PIVOTS ───────────────────────────────────────────────────────────────────
+up_src = break_src == "Close" ? close : high
+dn_src = break_src == "Close" ? close : low
+
+swing_ph = ta.pivothigh(high, swing_len, swing_len)
+swing_pl = ta.pivotlow(low,  swing_len, swing_len)
+int_ph   = ta.pivothigh(high, internal_len, internal_len)
+int_pl   = ta.pivotlow(low,  internal_len, internal_len)
+
+var swing    = Structure.new()
+var internal = Structure.new()
+
+[s_bull_bos, s_bull_choch, s_bear_bos, s_bear_choch, s_top, s_top_bar, s_btm, s_btm_bar] =
+     f_update(swing, swing_ph, swing_pl, swing_len, up_src, dn_src)
+
+[i_bull_bos, i_bull_choch, i_bear_bos, i_bear_choch, i_top, i_top_bar, i_btm, i_btm_bar] =
+     f_update(internal, int_ph, int_pl, internal_len, up_src, dn_src)
+
+// ─── DRAWING ──────────────────────────────────────────────────────────────────
+if show_swing
+    if s_bull_bos or s_bull_choch
+        f_draw(s_top, s_top_bar, s_bull_choch ? "CHoCH" : "BOS", bull_col, true, 2)
+    if s_bear_bos or s_bear_choch
+        f_draw(s_btm, s_btm_bar, s_bear_choch ? "CHoCH" : "BOS", bear_col, false, 2)
+
+if show_internal
+    if i_bull_bos or i_bull_choch
+        f_draw(i_top, i_top_bar, i_bull_choch ? "CHoCH" : "BOS", color.new(bull_col, 40), true, 1)
+    if i_bear_bos or i_bear_choch
+        f_draw(i_btm, i_btm_bar, i_bear_choch ? "CHoCH" : "BOS", color.new(bear_col, 40), false, 1)
+
+// ─── PENDING SWING LEVELS ─────────────────────────────────────────────────────
+pending_top = show_levels and show_swing and not swing.top_taken ? swing.top : na
+pending_btm = show_levels and show_swing and not swing.btm_taken ? swing.btm : na
+
+plot(pending_top, "Pending Swing High", color=color.new(bear_col, 45), style=plot.style_linebr, linewidth=1)
+plot(pending_btm, "Pending Swing Low",  color=color.new(bull_col, 45), style=plot.style_linebr, linewidth=1)
+
+// ─── TREND ────────────────────────────────────────────────────────────────────
+trend_col = swing.trend == 1 ? bull_col : swing.trend == -1 ? bear_col : color.gray
+barcolor(color_bars ? trend_col : na, title="Structure Trend")
+
+
+// ─── ALERTS ───────────────────────────────────────────────────────────────────
+alertcondition(s_bull_bos,   "Bullish BOS (Swing)",   "Bullish Break of Structure — swing high taken out with trend")
+alertcondition(s_bear_bos,   "Bearish BOS (Swing)",   "Bearish Break of Structure — swing low taken out with trend")
+alertcondition(s_bull_choch, "Bullish CHoCH (Swing)", "Bullish Change of Character — downtrend structure flipped up")
+alertcondition(s_bear_choch, "Bearish CHoCH (Swing)", "Bearish Change of Character — uptrend structure flipped down")
+alertcondition(s_bull_bos or s_bull_choch or s_bear_bos or s_bear_choch, "Any Swing Structure Break", "Market structure break on {{ticker}} {{interval}}")

@@ -1,0 +1,371 @@
+//@version=5
+// ═════════════════════════════════════════════════════════════════════════════
+//  CASSURES & RETESTS  —  Supports / Résistances
+// ─────────────────────────────────────────────────────────────────────────────
+//  Cycle de vie d'un niveau :
+//
+//    ACTIF ──cassure confirmée──> CASSÉ ──retour dans la zone + rejet──> RETESTÉ
+//      ▲                            │                                      │
+//      └────────────────────────────┴──────────────────────────────────────┘
+//                (le niveau repart ACTIF avec son rôle inversé :
+//                 une résistance cassée puis retestée devient un support)
+//
+//  Si le prix reprend le niveau dans l'autre sens avant le retest -> FAUSSE
+//  CASSURE. Si personne ne revient tester dans la fenêtre -> le niveau meurt.
+//
+//  Le signal de trade est le RETEST, pas la cassure : on attend que le prix
+//  revienne dans la zone du niveau cassé et qu'il la rejette.
+//
+//  Construction des niveaux : pivots hauts/bas, fusionnés quand ils tombent
+//  dans la même zone. Plus un niveau a été touché, plus son trait est épais.
+// ═════════════════════════════════════════════════════════════════════════════
+
+indicator(
+     title            = "Cassures & Retests S/R",
+     shorttitle       = "S/R Break•Retest",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 500,
+     max_bars_back    = 1000
+ )
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+g_lvl   = "1 • Détection des niveaux"
+piv_len = input.int(10, "Longueur des pivots", minval=2, maxval=100, group=g_lvl, tooltip="Bougies à gauche/droite pour valider un sommet ou un creux. Plus grand = niveaux plus majeurs mais confirmés plus tard.")
+tol_atr = input.float(0.25, "Épaisseur de zone (x ATR)", minval=0.01, step=0.05, group=g_lvl, tooltip="Sert à deux choses : fusionner deux pivots proches en un seul niveau, et définir la zone dans laquelle le retest est accepté.")
+max_lvl = input.int(12, "Nombre de niveaux suivis", minval=2, maxval=40, group=g_lvl)
+min_tch = input.int(2, "Touches pour un niveau « fort »", minval=1, maxval=10, group=g_lvl)
+far_atr = input.float(0.0, "Oublier les niveaux au-delà de (x ATR, 0 = off)", minval=0.0, step=1.0, group=g_lvl)
+atr_len = input.int(14, "Longueur ATR", minval=1, group=g_lvl)
+
+g_brk   = "2 • Cassure"
+brk_mod = input.string("Clôture", "Condition de cassure", options=["Clôture", "Corps entier", "Mèche"], group=g_brk, tooltip="Clôture : le close dépasse le niveau. Corps entier : open ET close dépassent. Mèche : le simple dépassement du high/low suffit (le plus permissif).")
+brk_buf = input.float(0.05, "Marge de cassure (x ATR)", minval=0.0, step=0.01, group=g_brk, tooltip="Distance à franchir au-delà du niveau pour éviter de compter les frôlements.")
+brk_cnf = input.int(1, "Clôtures consécutives requises", minval=1, maxval=5, group=g_brk)
+use_vol = input.bool(false, "Exiger un volume supérieur à la moyenne", group=g_brk)
+vol_len = input.int(20, "Moyenne de volume", minval=1, group=g_brk)
+vol_mlt = input.float(1.5, "Multiplicateur de volume", minval=0.1, step=0.1, group=g_brk)
+
+g_rt    = "3 • Retest"
+rt_win  = input.int(30, "Fenêtre de retest (bougies)", minval=1, maxval=300, group=g_rt, tooltip="Au-delà, la cassure n'est plus tradable : le niveau est abandonné.")
+rt_trav = input.float(0.5, "Éloignement minimum avant retest (x ATR)", minval=0.0, step=0.1, group=g_rt, tooltip="Le prix doit d'abord s'écarter du niveau. Évite de valider un retest sur la mèche de la bougie de cassure elle-même.")
+rt_rej  = input.bool(true, "Exiger une bougie de rejet", group=g_rt, tooltip="La bougie du retest doit clôturer dans le sens de la cassure (verte après une cassure haussière).")
+rt_recl = input.bool(true, "Marquer les fausses cassures", group=g_rt)
+
+g_sig   = "4 • Signaux"
+sig_rt  = input.bool(true,  "Flèches sur les retests validés", group=g_sig)
+sig_bk  = input.bool(false, "Flèches sur les cassures", group=g_sig)
+lab_bk  = input.bool(true,  "Étiquettes de cassure", group=g_sig)
+lab_rt  = input.bool(true,  "Étiquettes de retest", group=g_sig)
+
+g_vis   = "5 • Visuel"
+c_sup   = input.color(#089981, "Support", group=g_vis)
+c_res   = input.color(#f23645, "Résistance", group=g_vis)
+c_brk   = input.color(#ff9800, "Niveau cassé (attente de retest)", group=g_vis)
+c_fake  = input.color(#9c27b0, "Fausse cassure", group=g_vis)
+show_zn = input.bool(true, "Afficher les zones", group=g_vis)
+zn_alpha= input.int(88, "Transparence des zones", minval=50, maxval=99, group=g_vis)
+ext_bar = input.int(12, "Prolongation à droite (bougies)", minval=0, maxval=200, group=g_vis)
+show_px = input.bool(false, "Afficher le prix du niveau", group=g_vis)
+lab_sz  = input.string("small", "Taille des étiquettes", options=["tiny", "small", "normal"], group=g_vis)
+show_tb = input.bool(true, "Tableau de bord", group=g_vis)
+
+lsz = switch lab_sz
+    "tiny"  => size.tiny
+    "small" => size.small
+    => size.normal
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  TYPE & ÉTAT
+// ═════════════════════════════════════════════════════════════════════════════
+// state : 0 = actif, 1 = cassé (attente de retest), 2 = à supprimer
+// side  : +1 le prix est au-dessus (support), -1 le prix est en dessous (résistance)
+type Lvl
+    float p
+    int   born
+    int   side
+    int   touches
+    int   state
+    int   bdir
+    int   bbar
+    float trav
+    int   retests
+    line  ln
+    box   bx
+
+var array<Lvl> lvls = array.new<Lvl>()
+
+atr = ta.atr(atr_len)
+tol = atr * tol_atr
+buf = atr * brk_buf
+vol_ma = ta.sma(volume, vol_len)
+vol_ok = not use_vol or na(volume) or na(vol_ma) or volume > vol_ma * vol_mlt
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+// Valeur de référence de la bougie i selon le mode de cassure choisi.
+ref_up(i) =>
+    brk_mod == "Corps entier" ? math.min(open[i], close[i]) : brk_mod == "Mèche" ? high[i] : close[i]
+
+ref_dn(i) =>
+    brk_mod == "Corps entier" ? math.max(open[i], close[i]) : brk_mod == "Mèche" ? low[i] : close[i]
+
+broke_up(p, n) =>
+    ok = true
+    for i = 0 to n - 1
+        if ref_up(i) <= p + buf
+            ok := false
+            break
+    ok
+
+broke_dn(p, n) =>
+    ok = true
+    for i = 0 to n - 1
+        if ref_dn(i) >= p - buf
+            ok := false
+            break
+    ok
+
+lvl_color(l) =>
+    l.state == 1 ? c_brk : l.side > 0 ? c_sup : c_res
+
+lvl_width(l) =>
+    math.min(4, 1 + (l.touches >= min_tch ? 1 : 0) + math.min(2, l.retests))
+
+mark(y, txt, col, up) =>
+    label.new(bar_index, y, txt, style=up ? label.style_label_up : label.style_label_down, color=color.new(col, 15), textcolor=color.white, size=lsz)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  1. CRÉATION / FUSION DES NIVEAUX
+// ═════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, piv_len, piv_len)
+pl = ta.pivotlow(low, piv_len, piv_len)
+
+add_level(price, x) =>
+    merged = false
+    if array.size(lvls) > 0
+        for l in lvls
+            if l.state != 2 and math.abs(l.p - price) <= tol
+                l.touches += 1
+                merged := true
+                break
+    if not merged
+        sd = close > price ? 1 : -1
+        nl = Lvl.new(p = price, born = x, side = sd, touches = 1, state = 0, bdir = 0, bbar = na, trav = 0.0, retests = 0)
+        nl.ln := line.new(x, price, bar_index + ext_bar, price, color=sd > 0 ? c_sup : c_res, width=1)
+        nl.bx := box.new(x, price + tol, bar_index + ext_bar, price - tol, border_color=color.new(color.gray, 100), bgcolor=show_zn ? color.new(sd > 0 ? c_sup : c_res, zn_alpha) : color.new(color.gray, 100))
+        array.push(lvls, nl)
+    merged
+
+if not na(ph)
+    add_level(ph, bar_index - piv_len)
+if not na(pl)
+    add_level(pl, bar_index - piv_len)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  2. MACHINE À ÉTATS : CASSURE -> RETEST
+// ═════════════════════════════════════════════════════════════════════════════
+sig_brk_up = false
+sig_brk_dn = false
+sig_rt_up  = false
+sig_rt_dn  = false
+sig_fk_up  = false
+sig_fk_dn  = false
+last_evt   = ""
+
+if array.size(lvls) > 0
+    for l in lvls
+        if l.state == 0
+            // ─── Recherche d'une cassure ─────────────────────────────────────
+            if l.side < 0 and broke_up(l.p, brk_cnf) and vol_ok
+                l.state := 1
+                l.bdir  := 1
+                l.bbar  := bar_index
+                l.trav  := 0.0
+                sig_brk_up := true
+                last_evt := "Cassure ▲ " + str.tostring(l.p, format.mintick)
+                if lab_bk
+                    mark(l.p, "CASSURE ▲", c_brk, false)
+            else if l.side > 0 and broke_dn(l.p, brk_cnf) and vol_ok
+                l.state := 1
+                l.bdir  := -1
+                l.bbar  := bar_index
+                l.trav  := 0.0
+                sig_brk_dn := true
+                last_evt := "Cassure ▼ " + str.tostring(l.p, format.mintick)
+                if lab_bk
+                    mark(l.p, "CASSURE ▼", c_brk, true)
+
+        else if l.state == 1
+            // ─── Suivi de la cassure : retest, échec ou expiration ───────────
+            age = bar_index - l.bbar
+            if l.bdir > 0
+                l.trav := math.max(l.trav, high - l.p)
+                reclaimed = close < l.p - buf
+                in_zone   = low <= l.p + tol
+                far_ok    = l.trav >= atr * rt_trav
+                rej_ok    = not rt_rej or close > open
+                if reclaimed
+                    l.state := 0
+                    l.side  := -1
+                    if rt_recl
+                        sig_fk_up := true
+                        last_evt  := "Fausse cassure ▲"
+                        mark(l.p, "FAUSSE ▲", c_fake, false)
+                else if in_zone and far_ok and close > l.p and rej_ok
+                    l.state   := 0
+                    l.side    := 1
+                    l.retests += 1
+                    sig_rt_up := true
+                    last_evt  := "Retest ▲ " + str.tostring(l.p, format.mintick)
+                    if lab_rt
+                        mark(l.p, "RETEST ▲", c_sup, true)
+                else if age > rt_win
+                    l.state := 0
+                    l.side  := 1
+            else
+                l.trav := math.max(l.trav, l.p - low)
+                reclaimed = close > l.p + buf
+                in_zone   = high >= l.p - tol
+                far_ok    = l.trav >= atr * rt_trav
+                rej_ok    = not rt_rej or close < open
+                if reclaimed
+                    l.state := 0
+                    l.side  := 1
+                    if rt_recl
+                        sig_fk_dn := true
+                        last_evt  := "Fausse cassure ▼"
+                        mark(l.p, "FAUSSE ▼", c_fake, true)
+                else if in_zone and far_ok and close < l.p and rej_ok
+                    l.state   := 0
+                    l.side    := -1
+                    l.retests += 1
+                    sig_rt_dn := true
+                    last_evt  := "Retest ▼ " + str.tostring(l.p, format.mintick)
+                    if lab_rt
+                        mark(l.p, "RETEST ▼", c_res, false)
+                else if age > rt_win
+                    l.state := 0
+                    l.side  := -1
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  3. RENDU & NETTOYAGE
+// ═════════════════════════════════════════════════════════════════════════════
+if array.size(lvls) > 0
+    for l in lvls
+        if l.state != 2
+            if far_atr > 0 and math.abs(close - l.p) > atr * far_atr
+                l.state := 2
+            else
+                col = lvl_color(l)
+                line.set_x2(l.ln, bar_index + ext_bar)
+                line.set_color(l.ln, col)
+                line.set_width(l.ln, lvl_width(l))
+                line.set_style(l.ln, l.state == 1 ? line.style_dashed : line.style_solid)
+                box.set_right(l.bx, bar_index + ext_bar)
+                box.set_bgcolor(l.bx, show_zn ? color.new(col, zn_alpha) : color.new(color.gray, 100))
+
+// Suppression des niveaux morts, puis plafonnement du nombre de niveaux.
+if array.size(lvls) > 0
+    i = array.size(lvls) - 1
+    while i >= 0
+        l = array.get(lvls, i)
+        if l.state == 2
+            line.delete(l.ln)
+            box.delete(l.bx)
+            array.remove(lvls, i)
+        i -= 1
+
+// Quand le quota est dépassé, on sacrifie le niveau le plus éloigné du prix
+// plutôt que le plus ancien : un vieux niveau collé au marché reste utile.
+while array.size(lvls) > max_lvl
+    worst = 0
+    wdist = 0.0
+    for wi = 0 to array.size(lvls) - 1
+        d = math.abs(close - array.get(lvls, wi).p)
+        if d > wdist
+            wdist := d
+            worst := wi
+    lw = array.get(lvls, worst)
+    line.delete(lw.ln)
+    box.delete(lw.bx)
+    array.remove(lvls, worst)
+
+// ─── Étiquettes de prix sur la dernière bougie ────────────────────────────────
+var array<label> px_lab = array.new<label>()
+if show_px and barstate.islast
+    while array.size(px_lab) > 0
+        label.delete(array.pop(px_lab))
+    if array.size(lvls) > 0
+        for l in lvls
+            array.push(px_lab, label.new(bar_index + ext_bar, l.p, str.tostring(l.p, format.mintick), style=label.style_none, textcolor=lvl_color(l), size=size.tiny))
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  4. SIGNAUX
+// ═════════════════════════════════════════════════════════════════════════════
+plotshape(sig_rt and sig_rt_up, title="Retest haussier", style=shape.triangleup,   location=location.belowbar, color=c_sup,  size=size.small)
+plotshape(sig_rt and sig_rt_dn, title="Retest baissier", style=shape.triangledown, location=location.abovebar, color=c_res,  size=size.small)
+plotshape(sig_bk and sig_brk_up, title="Cassure haussière", style=shape.arrowup,   location=location.belowbar, color=c_brk, size=size.tiny)
+plotshape(sig_bk and sig_brk_dn, title="Cassure baissière", style=shape.arrowdown, location=location.abovebar, color=c_brk, size=size.tiny)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  5. TABLEAU DE BORD
+// ═════════════════════════════════════════════════════════════════════════════
+var table tb = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 82), border_color=color.new(color.gray, 60), border_width=1)
+var string evt_mem = "—"
+if last_evt != ""
+    evt_mem := last_evt
+
+cell(r, k, v, c) =>
+    table.cell(tb, 0, r, k, text_color=color.silver, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, r, v, text_color=c, text_size=size.small, text_halign=text.align_right)
+
+if show_tb and barstate.islast
+    // Niveau le plus proche au-dessus et en dessous du prix.
+    up_p = float(na)
+    dn_p = float(na)
+    if array.size(lvls) > 0
+        for l in lvls
+            if l.p > close and (na(up_p) or l.p < up_p)
+                up_p := l.p
+            if l.p < close and (na(dn_p) or l.p > dn_p)
+                dn_p := l.p
+
+    table.cell(tb, 0, 0, "Cassures & Retests", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 0, timeframe.period, text_color=color.white, text_size=size.small, text_halign=text.align_right)
+
+    up_txt = na(up_p) ? "—" : str.tostring(up_p, format.mintick) + "  (+" + str.tostring((up_p - close) / close * 100, "#.##") + "%)"
+    dn_txt = na(dn_p) ? "—" : str.tostring(dn_p, format.mintick) + "  (-" + str.tostring((close - dn_p) / close * 100, "#.##") + "%)"
+    cell(1, "Résistance", up_txt, na(up_p) ? color.gray : c_res)
+    cell(2, "Support", dn_txt, na(dn_p) ? color.gray : c_sup)
+
+    n_wait = 0
+    if array.size(lvls) > 0
+        for l in lvls
+            if l.state == 1
+                n_wait += 1
+    cell(3, "Niveaux suivis", str.tostring(array.size(lvls)), color.white)
+    cell(4, "Retests en attente", str.tostring(n_wait), n_wait > 0 ? c_brk : color.gray)
+
+    evt_col = str.contains(evt_mem, "▲") ? c_sup : str.contains(evt_mem, "▼") ? c_res : color.gray
+    cell(5, "Dernier événement", evt_mem, evt_col)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  6. ALERTES
+// ═════════════════════════════════════════════════════════════════════════════
+alertcondition(sig_brk_up, "Cassure de résistance", "Cassure de résistance sur {{ticker}} ({{interval}})")
+alertcondition(sig_brk_dn, "Cassure de support",    "Cassure de support sur {{ticker}} ({{interval}})")
+alertcondition(sig_rt_up,  "Retest haussier validé","Retest haussier validé sur {{ticker}} ({{interval}}) — support confirmé")
+alertcondition(sig_rt_dn,  "Retest baissier validé","Retest baissier validé sur {{ticker}} ({{interval}}) — résistance confirmée")
+alertcondition(sig_fk_up,  "Fausse cassure haussière", "Fausse cassure haussière sur {{ticker}} ({{interval}})")
+alertcondition(sig_fk_dn,  "Fausse cassure baissière", "Fausse cassure baissière sur {{ticker}} ({{interval}})")
+alertcondition(sig_rt_up or sig_rt_dn, "Retest (tous sens)", "Retest validé sur {{ticker}} ({{interval}})")
+
+if sig_rt_up
+    alert("Retest haussier validé @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if sig_rt_dn
+    alert("Retest baissier validé @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)

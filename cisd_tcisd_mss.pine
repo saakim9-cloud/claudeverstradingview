@@ -13,8 +13,13 @@
 //        plus bas / plus haut courant), valide par :
 //          - une prise de liquidite sur cet extreme (sweep)   [optionnel]
 //          - un deplacement significatif (bougie >= k x ATR)  [optionnel]
-//        C'est le CISD qui marque le vrai retournement de livraison, et non un
-//        simple bruit a l'interieur de la jambe.
+//        C'est le CISD qui marque le vrai retournement de livraison.
+//        Rendu en ligne noire prolongee + texte "tcisd" (style du chart).
+//
+//  TCISD HTF
+//        Le meme moteur applique a une unite de temps superieure (ex. 15m sur
+//        un graphique 3m) -> ligne "tcisd-15m". Non repeint : ne travaille que
+//        sur des bougies HTF cloturees.
 //
 //  MSS / BOS
 //        Cassure en cloture d'un swing confirme :
@@ -22,8 +27,8 @@
 //          - dans le sens de la tendance -> BOS (Break Of Structure)
 //
 //  SETUP A+
-//        MSS et TCISD de meme sens a l'interieur d'une fenetre de confluence,
-//        filtres par le biais HTF et la session.
+//        MSS et TCISD de meme sens dans une fenetre de confluence, filtres par
+//        le biais HTF et la session. Fleche bleue (long) / rouge (short).
 // ═════════════════════════════════════════════════════════════════════════════
 
 indicator(
@@ -50,8 +55,8 @@ g_cisd       = "2 • CISD"
 show_cisd    = input.bool(true, "Afficher les CISD", group=g_cisd)
 min_run      = input.int(1, "Bougies minimum dans la jambe", minval=1, maxval=20, group=g_cisd, tooltip="Nombre minimum de bougies consecutives de meme sens pour qu'une jambe de livraison soit valide.")
 cisd_keep    = input.int(8, "Nombre de niveaux conserves a l'ecran", minval=1, maxval=50, group=g_cisd)
-cisd_extend  = input.bool(true, "Prolonger les niveaux jusqu'a invalidation", group=g_cisd)
-cisd_max_ext = input.int(120, "Extension maximum (bougies)", minval=5, maxval=500, group=g_cisd)
+cisd_max_ext = input.int(300, "Duree de vie maximum (bougies)", minval=5, maxval=1000, group=g_cisd)
+cisd_del     = input.bool(false, "Supprimer le niveau a l'invalidation", group=g_cisd, tooltip="Decoche : le niveau invalide reste en pointille gris.")
 
 // ─── INPUTS : TCISD ───────────────────────────────────────────────────────────
 g_tcisd      = "3 • TCISD (True CISD)"
@@ -61,26 +66,43 @@ t_req_disp   = input.bool(true, "Exiger un deplacement (ATR)", group=g_tcisd)
 t_disp_mult  = input.float(1.0, "Deplacement minimum (x ATR)", minval=0.1, step=0.1, group=g_tcisd)
 atr_len      = input.int(14, "Longueur ATR", minval=1, group=g_tcisd)
 
+// ─── INPUTS : TCISD HTF ───────────────────────────────────────────────────────
+g_mtf        = "4 • TCISD multi-timeframe"
+show_htf     = input.bool(true, "Afficher le CISD d'une UT superieure", group=g_mtf)
+htf_cisd_tf  = input.timeframe("15", "Unite de temps du CISD HTF", group=g_mtf, tooltip="Doit etre superieure ou egale a l'UT du graphique. Le moteur ne travaille que sur des bougies HTF cloturees (aucun repaint).")
+htf_min_run  = input.int(1, "Bougies minimum dans la jambe (HTF)", minval=1, maxval=20, group=g_mtf)
+htf_keep     = input.int(4, "Nombre de niveaux HTF conserves", minval=1, maxval=20, group=g_mtf)
+
 // ─── INPUTS : FILTRES ─────────────────────────────────────────────────────────
-g_flt        = "4 • Filtres"
+g_flt        = "5 • Filtres"
 use_htf      = input.bool(false, "Filtre biais HTF", group=g_flt)
-htf_tf       = input.timeframe("60", "Unite de temps HTF", group=g_flt)
+htf_tf       = input.timeframe("60", "Unite de temps du biais", group=g_flt)
 htf_len      = input.int(50, "EMA du biais HTF", minval=1, group=g_flt)
 use_sess     = input.bool(false, "Filtre session", group=g_flt)
 sess_str     = input.session("0700-1600", "Session (heure de l'exchange)", group=g_flt)
 show_sess_bg = input.bool(false, "Colorer la session", group=g_flt)
 
 // ─── INPUTS : SETUP A+ ────────────────────────────────────────────────────────
-g_setup      = "5 • Setup A+ (MSS + TCISD)"
+g_setup      = "6 • Setup A+ (MSS + TCISD)"
 show_setup   = input.bool(true, "Afficher les setups A+", group=g_setup)
 setup_window = input.int(10, "Fenetre de confluence (bougies)", minval=1, maxval=100, group=g_setup, tooltip="Ecart maximum entre le MSS et le TCISD pour valider le setup.")
 
 // ─── INPUTS : VISUEL ──────────────────────────────────────────────────────────
-g_vis        = "6 • Visuel"
+g_vis        = "7 • Visuel"
 col_bull     = input.color(#089981, "Couleur haussiere", group=g_vis)
 col_bear     = input.color(#f23645, "Couleur baissiere", group=g_vis)
 col_dead     = input.color(color.new(color.gray, 55), "Couleur invalidee", group=g_vis)
-lbl_size     = input.string("tiny", "Taille des etiquettes", options=["tiny", "small", "normal", "large"], group=g_vis)
+col_cisd_ln  = input.color(#000000, "Couleur des lignes CISD / TCISD", group=g_vis, tooltip="Noir comme sur le chart de reference. Mets une couleur transparente pour revenir au code couleur haussier/baissier.")
+use_dir_col  = input.bool(false, "Colorer les CISD selon le sens", group=g_vis)
+cisd_w       = input.int(3, "Epaisseur des lignes TCISD", minval=1, maxval=5, group=g_vis)
+ext_bars     = input.int(25, "Prolongation vers la droite (bougies)", minval=0, maxval=300, group=g_vis)
+txt_tcisd    = input.string("tcisd", "Texte des TCISD", group=g_vis)
+txt_cisd     = input.string("cisd",  "Texte des CISD", group=g_vis)
+show_txt     = input.bool(true, "Afficher le texte a droite des lignes", group=g_vis)
+txt_size     = input.string("normal", "Taille du texte des CISD", options=["tiny", "small", "normal", "large", "huge"], group=g_vis)
+col_arrow_up = input.color(#2962ff, "Couleur fleche long", group=g_vis)
+col_arrow_dn = input.color(#f23645, "Couleur fleche short", group=g_vis)
+lbl_size     = input.string("tiny", "Taille des etiquettes de structure", options=["tiny", "small", "normal", "large"], group=g_vis)
 show_panel   = input.bool(true, "Afficher le tableau de bord", group=g_vis)
 panel_pos    = input.string("Haut droite", "Position du tableau", options=["Haut droite", "Haut gauche", "Bas droite", "Bas gauche", "Milieu droite"], group=g_vis)
 
@@ -89,6 +111,13 @@ lbl_sz = switch lbl_size
     "small"  => size.small
     "normal" => size.normal
     => size.large
+
+txt_sz = switch txt_size
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+    "large"  => size.large
+    => size.huge
 
 tbl_pos = switch panel_pos
     "Haut droite" => position.top_right
@@ -115,11 +144,9 @@ disp_ok  = not t_req_disp or (high - low) >= atr * t_disp_mult
 ph = ta.pivothigh(high, swing_len, swing_len)
 pl = ta.pivotlow(low, swing_len, swing_len)
 
-// Pools de liquidite encore intacts (swings jamais traverses)
 var array<float> pool_hi = array.new<float>()
 var array<float> pool_lo = array.new<float>()
 
-// Swing de reference pour la cassure de structure
 var float ref_hi   = na
 var int   ref_hi_x = na
 var float ref_lo   = na
@@ -146,8 +173,8 @@ if array.size(pool_lo) > 30
 
 // Un sweep = la meche traverse le pool puis la cloture revient a l'interieur.
 // Le pool traverse est consomme dans tous les cas (la liquidite a ete prise).
-var int last_sweep_lo_x = na   // liquidite BASSE prise  -> carburant haussier
-var int last_sweep_hi_x = na   // liquidite HAUTE prise  -> carburant baissier
+var int last_sweep_lo_x = na
+var int last_sweep_hi_x = na
 sweep_lo = false
 sweep_hi = false
 
@@ -182,7 +209,6 @@ if sweep_hi
 // ═════════════════════════════════════════════════════════════════════════════
 //  2. JAMBES DE LIVRAISON (moteur CISD)
 // ═════════════════════════════════════════════════════════════════════════════
-// Sequence baissiere -> fournit le niveau d'un CISD haussier
 var bool  bear_on   = false
 var float bear_open = na
 var int   bear_x    = na
@@ -190,7 +216,6 @@ var float bear_low  = na
 var int   bear_len  = 0
 var bool  bear_used = false
 
-// Sequence haussiere -> fournit le niveau d'un CISD baissier
 var bool  bull_on   = false
 var float bull_open = na
 var int   bull_x    = na
@@ -273,7 +298,6 @@ cisd_bear  = show_cisd  and cisd_bear_raw  and in_sess
 tcisd_bull = show_tcisd and tcisd_bull_raw and in_sess
 tcisd_bear = show_tcisd and tcisd_bear_raw and in_sess
 
-// Consommation des etats (independante de l'affichage pour rester coherent)
 if cisd_bull_raw
     bear_used := true
 if cisd_bear_raw
@@ -300,18 +324,17 @@ var array<int>   c_dir  = array.new<int>()
 var array<bool>  c_live = array.new<bool>()
 var array<int>   c_from = array.new<int>()
 
-draw_cisd(lvl, x1, dir, is_true) =>
-    col = dir > 0 ? col_bull : col_bear
-    ln  = line.new(x1, lvl, bar_index, lvl, color=col, width=is_true ? 2 : 1, style=is_true ? line.style_solid : line.style_dashed)
-    txt = is_true ? (dir > 0 ? "TCISD ▲" : "TCISD ▼") : "CISD"
-    lb  = label.new(bar_index, lvl, txt, style=dir > 0 ? label.style_label_up : label.style_label_down, color=color.new(col, is_true ? 15 : 60), textcolor=is_true ? color.white : col, size=lbl_sz)
+draw_cisd(lvl, x1, dir, is_true, txt, keep) =>
+    base = use_dir_col ? (dir > 0 ? col_bull : col_bear) : col_cisd_ln
+    ln   = line.new(x1, lvl, bar_index + ext_bars, lvl, color=base, width=is_true ? cisd_w : 1, style=is_true ? line.style_solid : line.style_dashed)
+    lb   = label.new(bar_index + ext_bars, lvl, show_txt ? txt : "", style=label.style_none, textcolor=base, size=txt_sz, textalign=text.align_left)
     array.push(c_line, ln)
     array.push(c_lab, lb)
     array.push(c_lvl, lvl)
     array.push(c_dir, dir)
     array.push(c_live, true)
     array.push(c_from, bar_index)
-    if array.size(c_line) > cisd_keep
+    if array.size(c_line) > keep
         line.delete(array.shift(c_line))
         label.delete(array.shift(c_lab))
         array.shift(c_lvl)
@@ -321,32 +344,143 @@ draw_cisd(lvl, x1, dir, is_true) =>
     true
 
 if tcisd_bull
-    draw_cisd(leg_lo_open, nz(leg_lo_x, bar_index), 1, true)
+    draw_cisd(leg_lo_open, nz(leg_lo_x, bar_index), 1, true, txt_tcisd, cisd_keep)
 else if cisd_bull
-    draw_cisd(bear_open, nz(bear_x, bar_index), 1, false)
+    draw_cisd(bear_open, nz(bear_x, bar_index), 1, false, txt_cisd, cisd_keep)
 
 if tcisd_bear
-    draw_cisd(leg_hi_open, nz(leg_hi_x, bar_index), -1, true)
+    draw_cisd(leg_hi_open, nz(leg_hi_x, bar_index), -1, true, txt_tcisd, cisd_keep)
 else if cisd_bear
-    draw_cisd(bull_open, nz(bull_x, bar_index), -1, false)
+    draw_cisd(bull_open, nz(bull_x, bar_index), -1, false, txt_cisd, cisd_keep)
 
-if cisd_extend and array.size(c_line) > 0
-    for i = 0 to array.size(c_line) - 1
+// Prolongation / invalidation
+if array.size(c_line) > 0
+    i = array.size(c_line) - 1
+    while i >= 0
         if array.get(c_live, i)
-            lv = array.get(c_lvl, i)
-            dr = array.get(c_dir, i)
-            broken = dr > 0 ? close < lv : close > lv
+            lv      = array.get(c_lvl, i)
+            dr      = array.get(c_dir, i)
+            broken  = dr > 0 ? close < lv : close > lv
             expired = bar_index - array.get(c_from, i) > cisd_max_ext
-            line.set_x2(array.get(c_line, i), bar_index)
+            line.set_x2(array.get(c_line, i), bar_index + ext_bars)
+            label.set_x(array.get(c_lab, i), bar_index + ext_bars)
             if broken or expired
                 array.set(c_live, i, false)
-                line.set_color(array.get(c_line, i), col_dead)
-                line.set_style(array.get(c_line, i), line.style_dotted)
+                if cisd_del
+                    line.delete(array.get(c_line, i))
+                    label.delete(array.get(c_lab, i))
+                else
+                    line.set_color(array.get(c_line, i), col_dead)
+                    line.set_style(array.get(c_line, i), line.style_dotted)
+                    label.set_textcolor(array.get(c_lab, i), col_dead)
+        i -= 1
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  3bis. TCISD MULTI-TIMEFRAME  (ligne "tcisd-15m")
+// ═════════════════════════════════════════════════════════════════════════════
+// Moteur autonome : ne consomme que des bougies HTF DEJA CLOTUREES.
+cisd_engine(o, c, adv, minrun) =>
+    var bool  bon   = false
+    var float bop   = na
+    var int   blen  = 0
+    var bool  bused = false
+    var bool  uon   = false
+    var float uop   = na
+    var int   ulen  = 0
+    var bool  uused = false
+    sig_up  = false
+    sig_dn  = false
+    lvl_up  = float(na)
+    lvl_dn  = float(na)
+    if adv
+        is_dn = c < o
+        is_up = c > o
+        if is_dn
+            if bon
+                blen += 1
+            else
+                bon   := true
+                bop   := o
+                blen  := 1
+                bused := false
+            uon := false
+        else if is_up
+            if uon
+                ulen += 1
+            else
+                uon   := true
+                uop   := o
+                ulen  := 1
+                uused := false
+            bon := false
+        if not bon and not bused and not na(bop) and blen >= minrun and c > bop
+            bused  := true
+            sig_up := true
+            lvl_up := bop
+        if not uon and not uused and not na(uop) and ulen >= minrun and c < uop
+            uused  := true
+            sig_dn := true
+            lvl_dn := uop
+    [sig_up, lvl_up, sig_dn, lvl_dn]
+
+htf_valid = timeframe.in_seconds(htf_cisd_tf) >= timeframe.in_seconds(timeframe.period)
+[h_o, h_c, h_t] = request.security(syminfo.tickerid, htf_cisd_tf, [open[1], close[1], time[1]], barmerge.gaps_off, barmerge.lookahead_off)
+htf_adv = show_htf and htf_valid and not na(h_t) and h_t != h_t[1]
+[h_up, h_lvl_up, h_dn, h_lvl_dn] = cisd_engine(h_o, h_c, htf_adv, htf_min_run)
+
+var array<line>  h_line = array.new<line>()
+var array<label> h_lab  = array.new<label>()
+var array<float> h_lvl  = array.new<float>()
+var array<int>   h_dir  = array.new<int>()
+var array<bool>  h_live = array.new<bool>()
+
+htf_txt = txt_tcisd + "-" + htf_cisd_tf
+
+draw_htf(lvl, dir) =>
+    base = use_dir_col ? (dir > 0 ? col_bull : col_bear) : col_cisd_ln
+    ln   = line.new(bar_index, lvl, bar_index + ext_bars, lvl, color=base, width=cisd_w, style=line.style_solid)
+    lb   = label.new(bar_index + ext_bars, lvl, show_txt ? htf_txt : "", style=label.style_none, textcolor=base, size=txt_sz, textalign=text.align_left)
+    array.push(h_line, ln)
+    array.push(h_lab, lb)
+    array.push(h_lvl, lvl)
+    array.push(h_dir, dir)
+    array.push(h_live, true)
+    if array.size(h_line) > htf_keep
+        line.delete(array.shift(h_line))
+        label.delete(array.shift(h_lab))
+        array.shift(h_lvl)
+        array.shift(h_dir)
+        array.shift(h_live)
+    true
+
+if h_up and not na(h_lvl_up)
+    draw_htf(h_lvl_up, 1)
+if h_dn and not na(h_lvl_dn)
+    draw_htf(h_lvl_dn, -1)
+
+if array.size(h_line) > 0
+    j = array.size(h_line) - 1
+    while j >= 0
+        if array.get(h_live, j)
+            lvj = array.get(h_lvl, j)
+            drj = array.get(h_dir, j)
+            line.set_x2(array.get(h_line, j), bar_index + ext_bars)
+            label.set_x(array.get(h_lab, j), bar_index + ext_bars)
+            if (drj > 0 and close < lvj) or (drj < 0 and close > lvj)
+                array.set(h_live, j, false)
+                if cisd_del
+                    line.delete(array.get(h_line, j))
+                    label.delete(array.get(h_lab, j))
+                else
+                    line.set_color(array.get(h_line, j), col_dead)
+                    line.set_style(array.get(h_line, j), line.style_dotted)
+                    label.set_textcolor(array.get(h_lab, j), col_dead)
+        j -= 1
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  4. MSS / BOS
 // ═════════════════════════════════════════════════════════════════════════════
-var int    trend           = 0     //  1 = haussier, -1 = baissier, 0 = indetermine
+var int    trend           = 0
 var int    last_mss_bull_x = na
 var int    last_mss_bear_x = na
 var string last_struct     = "—"
@@ -405,8 +539,8 @@ if break_down
 pair_bull = not na(last_mss_bull_x) and not na(last_tcisd_bull_x)
 pair_bear = not na(last_mss_bear_x) and not na(last_tcisd_bear_x)
 
-gap_bull  = pair_bull ? math.abs(last_mss_bull_x - last_tcisd_bull_x) : na
-gap_bear  = pair_bear ? math.abs(last_mss_bear_x - last_tcisd_bear_x) : na
+gap_bull = pair_bull ? math.abs(last_mss_bull_x - last_tcisd_bull_x) : na
+gap_bear = pair_bear ? math.abs(last_mss_bear_x - last_tcisd_bear_x) : na
 
 fresh_bull = pair_bull and math.max(last_mss_bull_x, last_tcisd_bull_x) == bar_index
 fresh_bear = pair_bear and math.max(last_mss_bear_x, last_tcisd_bear_x) == bar_index
@@ -417,13 +551,13 @@ conf_bear = fresh_bear and gap_bear <= setup_window
 setup_long  = show_setup and conf_bull and (not use_htf or htf_bias >= 0) and in_sess
 setup_short = show_setup and conf_bear and (not use_htf or htf_bias <= 0) and in_sess
 
-plotshape(setup_long,  title="Setup LONG",  style=shape.triangleup,   location=location.belowbar, color=col_bull, size=size.small)
-plotshape(setup_short, title="Setup SHORT", style=shape.triangledown, location=location.abovebar, color=col_bear, size=size.small)
+plotshape(setup_long,  title="Setup LONG",  style=shape.arrowup,   location=location.belowbar, color=col_arrow_up, size=size.small)
+plotshape(setup_short, title="Setup SHORT", style=shape.arrowdown, location=location.abovebar, color=col_arrow_dn, size=size.small)
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  6. TABLEAU DE BORD
 // ═════════════════════════════════════════════════════════════════════════════
-var table dash = table.new(tbl_pos, 2, 7, bgcolor=color.new(color.black, 82), border_color=color.new(color.gray, 60), border_width=1)
+var table dash = table.new(tbl_pos, 2, 8, bgcolor=color.new(color.black, 82), border_color=color.new(color.gray, 60), border_width=1)
 
 row(r, k, v, c) =>
     table.cell(dash, 0, r, k, text_color=color.silver, text_size=size.small, text_halign=text.align_left)
@@ -449,15 +583,23 @@ if show_panel and barstate.islast
     tc_col  = tc_none ? color.gray : tc_up ? col_bull : col_bear
     row(3, "Dernier TCISD", tc_txt, tc_col)
 
+    hn       = array.size(h_lvl)
+    htf_txt2 = not show_htf ? "off" : not htf_valid ? "UT trop basse" : "aucun"
+    htf_col2 = color.gray
+    if show_htf and htf_valid and hn > 0
+        htf_txt2 := str.tostring(array.get(h_lvl, hn - 1), format.mintick)
+        htf_col2 := array.get(h_dir, hn - 1) > 0 ? col_bull : col_bear
+    row(4, "CISD " + htf_cisd_tf, htf_txt2, htf_col2)
+
     h_txt = not use_htf ? "off" : htf_bias == 1 ? "▲ " + htf_tf : htf_bias == -1 ? "▼ " + htf_tf : "plat"
     h_col = not use_htf ? color.gray : htf_bias == 1 ? col_bull : htf_bias == -1 ? col_bear : color.gray
-    row(4, "Biais HTF", h_txt, h_col)
+    row(5, "Biais HTF", h_txt, h_col)
 
     e_txt = not use_sess ? "off" : sess_now ? "ACTIVE" : "FERMEE"
     e_col = not use_sess ? color.gray : sess_now ? col_bull : col_bear
-    row(5, "Session", e_txt, e_col)
+    row(6, "Session", e_txt, e_col)
 
-    row(6, "ATR " + str.tostring(atr_len), str.tostring(atr, format.mintick), color.white)
+    row(7, "ATR " + str.tostring(atr_len), str.tostring(atr, format.mintick), color.white)
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  7. ALERTES
@@ -466,6 +608,8 @@ alertcondition(cisd_bull,   "CISD haussier",         "CISD haussier sur {{ticker
 alertcondition(cisd_bear,   "CISD baissier",         "CISD baissier sur {{ticker}} ({{interval}})")
 alertcondition(tcisd_bull,  "TCISD haussier",        "TCISD haussier (vrai CISD) sur {{ticker}} ({{interval}})")
 alertcondition(tcisd_bear,  "TCISD baissier",        "TCISD baissier (vrai CISD) sur {{ticker}} ({{interval}})")
+alertcondition(h_up,        "CISD HTF haussier",     "CISD HTF haussier sur {{ticker}} ({{interval}})")
+alertcondition(h_dn,        "CISD HTF baissier",     "CISD HTF baissier sur {{ticker}} ({{interval}})")
 alertcondition(mss_bull,    "MSS haussier",          "MSS haussier sur {{ticker}} ({{interval}})")
 alertcondition(mss_bear,    "MSS baissier",          "MSS baissier sur {{ticker}} ({{interval}})")
 alertcondition(bos_bull,    "BOS haussier",          "BOS haussier sur {{ticker}} ({{interval}})")

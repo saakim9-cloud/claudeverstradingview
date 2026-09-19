@@ -1,0 +1,447 @@
+//@version=5
+// ═════════════════════════════════════════════════════════════════════════════
+//  ICT CONTEXT TOOLKIT  —  FVG/IFVG • Order Blocks • Sessions • Opens • Gaps
+// ─────────────────────────────────────────────────────────────────────────────
+//  Complement du script "CISD / TCISD + MSS" : il dessine tout le contexte
+//  visible sur un chart ICT classique.
+//
+//  1. FVG / IFVG   Fair Value Gaps et leur inversion (IFVG) une fois comblés.
+//  2. Order Blocks Derniere bougie opposee avant le deplacement qui cree le FVG.
+//  3. Sessions     4 plages configurables : ombrage killzone, boite de range,
+//                  lignes High/Low prolongees et etiquetees (ex. "NYAM High").
+//  4. Opens        Theorie des quarts (Quarterly Theory) :
+//                    TDO     True Day Open      = 00:00 NY (Q2 du cycle 18h-18h)
+//                    90mO    ouverture du cycle 90 min
+//                    T90     True 90 Open       = +22,5 min dans le cycle 90 min
+//                    TMicroO True Micro Open    = +5,625 min dans le micro cycle
+//                  + 3 heures personnalisees (par defaut 08:30 et 09:30 NY).
+//  5. Gaps         NDOG (New Day Opening Gap) et NWOG (New Week Opening Gap).
+//  6. Timer        Compte a rebours de cloture de la bougie ("TF: 03:26").
+//
+//  NOTE PRECISION : les cycles de 22,5 min et 5,625 min ne tombent pas sur une
+//  frontiere de bougie en 5m/15m. Le niveau est pris sur l'ouverture de la
+//  PREMIERE bougie qui atteint ou depasse l'heure cible. Pour un placement
+//  exact, utilise un graphique 1m ou en secondes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+indicator(
+     title            = "ICT Context Toolkit",
+     shorttitle       = "ICT•CTX",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 500,
+     max_bars_back    = 1000
+ )
+
+tz = input.string("America/New_York", "Fuseau horaire de reference", options=["America/New_York", "Europe/London", "Europe/Paris", "Asia/Tokyo", "UTC"], group="0 • Général")
+gl_txt_sz = input.string("small", "Taille des textes", options=["tiny", "small", "normal", "large"], group="0 • Général")
+
+txt_sz = switch gl_txt_sz
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+    => size.large
+
+// ─── INPUTS : FVG / IFVG ──────────────────────────────────────────────────────
+g_fvg     = "1 • FVG / IFVG"
+show_fvg  = input.bool(true, "Afficher les FVG", group=g_fvg)
+show_ifvg = input.bool(true, "Afficher les IFVG (FVG inverses)", group=g_fvg)
+fvg_atr   = input.float(0.0, "Taille minimum (x ATR, 0 = off)", minval=0.0, step=0.1, group=g_fvg)
+fvg_ext   = input.int(40, "Longueur des boites (bougies)", minval=1, maxval=500, group=g_fvg)
+fvg_keep  = input.int(12, "Nombre de FVG conserves", minval=1, maxval=60, group=g_fvg)
+fvg_fill  = input.color(color.new(#ffe082, 70), "Fond FVG", group=g_fvg)
+fvg_bord  = input.color(color.new(#ffa726, 20), "Bordure FVG", group=g_fvg)
+ifvg_fill = input.color(color.new(#ffe082, 55), "Fond IFVG", group=g_fvg)
+ifvg_bord = input.color(color.new(#fb8c00, 0),  "Bordure IFVG", group=g_fvg)
+ifvg_txt  = input.string("IFVG", "Texte des IFVG", group=g_fvg)
+
+// ─── INPUTS : ORDER BLOCKS ────────────────────────────────────────────────────
+g_ob      = "2 • Order Blocks"
+show_ob   = input.bool(true, "Afficher les Order Blocks", group=g_ob)
+ob_body   = input.bool(false, "Corps uniquement (sinon meche comprise)", group=g_ob)
+ob_lb     = input.int(12, "Recherche en arriere (bougies)", minval=2, maxval=60, group=g_ob)
+ob_ext    = input.int(40, "Longueur des boites (bougies)", minval=1, maxval=500, group=g_ob)
+ob_keep   = input.int(10, "Nombre d'OB conserves", minval=1, maxval=40, group=g_ob)
+ob_fill   = input.color(color.new(#7e57c2, 45), "Fond Order Block", group=g_ob)
+ob_bord   = input.color(color.new(#fb8c00, 0),  "Bordure Order Block", group=g_ob)
+ob_del    = input.bool(true, "Supprimer une fois mitige", group=g_ob)
+
+// ─── INPUTS : SESSIONS ────────────────────────────────────────────────────────
+g_s1 = "3 • Session 1"
+s1_on   = input.bool(true, "Activer", group=g_s1)
+s1_nm   = input.string("NYAM", "Nom", group=g_s1)
+s1_ss   = input.session("0930-1100", "Plage horaire", group=g_s1)
+s1_col  = input.color(#ff9800, "Couleur", group=g_s1)
+s1_shade= input.bool(true,  "Ombrage vertical (killzone)", group=g_s1)
+s1_box  = input.bool(false, "Boite de range", group=g_s1)
+s1_lvl  = input.bool(true,  "Lignes High / Low", group=g_s1)
+
+g_s2 = "3 • Session 2"
+s2_on   = input.bool(true, "Activer", group=g_s2)
+s2_nm   = input.string("NYPM", "Nom", group=g_s2)
+s2_ss   = input.session("1330-1600", "Plage horaire", group=g_s2)
+s2_col  = input.color(#9e9e9e, "Couleur", group=g_s2)
+s2_shade= input.bool(true,  "Ombrage vertical (killzone)", group=g_s2)
+s2_box  = input.bool(false, "Boite de range", group=g_s2)
+s2_lvl  = input.bool(true,  "Lignes High / Low", group=g_s2)
+
+g_s3 = "3 • Session 3"
+s3_on   = input.bool(false, "Activer", group=g_s3)
+s3_nm   = input.string("LDN", "Nom", group=g_s3)
+s3_ss   = input.session("0200-0500", "Plage horaire", group=g_s3)
+s3_col  = input.color(#ab47bc, "Couleur", group=g_s3)
+s3_shade= input.bool(true,  "Ombrage vertical (killzone)", group=g_s3)
+s3_box  = input.bool(false, "Boite de range", group=g_s3)
+s3_lvl  = input.bool(true,  "Lignes High / Low", group=g_s3)
+
+g_s4 = "3 • Session 4"
+s4_on   = input.bool(false, "Activer", group=g_s4)
+s4_nm   = input.string("ASIA", "Nom", group=g_s4)
+s4_ss   = input.session("2000-0000", "Plage horaire", group=g_s4)
+s4_col  = input.color(#26a69a, "Couleur", group=g_s4)
+s4_shade= input.bool(true,  "Ombrage vertical (killzone)", group=g_s4)
+s4_box  = input.bool(false, "Boite de range", group=g_s4)
+s4_lvl  = input.bool(true,  "Lignes High / Low", group=g_s4)
+
+g_sg  = "3 • Sessions (commun)"
+s_ext = input.int(60, "Prolongation des lignes High/Low", minval=0, maxval=500, group=g_sg)
+s_keep= input.int(2, "Nombre de sessions conservees", minval=1, maxval=10, group=g_sg)
+
+// ─── INPUTS : OPENS (QUARTERLY THEORY) ────────────────────────────────────────
+g_op    = "4 • Opens (théorie des quarts)"
+op_ext  = input.int(60, "Longueur des lignes (bougies)", minval=1, maxval=500, group=g_op)
+op_txt  = input.bool(true, "Afficher les etiquettes", group=g_op)
+
+tdo_on  = input.bool(true, "TDO — True Day Open (00:00)", group=g_op)
+tdo_col = input.color(#2962ff, "Couleur TDO", group=g_op)
+tdo_keep= input.int(2, "Nombre conserve (TDO)", minval=1, maxval=20, group=g_op)
+
+n90_on  = input.bool(true, "90mO — ouverture du cycle 90 min", group=g_op)
+n90_col = input.color(color.new(#2962ff, 40), "Couleur 90mO", group=g_op)
+n90_keep= input.int(4, "Nombre conserve (90mO)", minval=1, maxval=30, group=g_op)
+
+t90_on  = input.bool(true, "T90 — True 90 Open (+22,5 min)", group=g_op)
+t90_col = input.color(#1565c0, "Couleur T90", group=g_op)
+t90_keep= input.int(4, "Nombre conserve (T90)", minval=1, maxval=30, group=g_op)
+
+tmo_on  = input.bool(true, "TMicroO — True Micro Open (+5,625 min)", group=g_op)
+tmo_col = input.color(color.new(#42a5f5, 20), "Couleur TMicroO", group=g_op)
+tmo_keep= input.int(8, "Nombre conserve (TMicroO)", minval=1, maxval=40, group=g_op)
+
+g_ct    = "4 • Opens personnalisés"
+c1_on   = input.bool(true, "Open perso 1", group=g_ct)
+c1_hm   = input.string("08:30", "Heure 1 (HH:MM)", group=g_ct)
+c1_col  = input.color(#ff9800, "Couleur 1", group=g_ct)
+c2_on   = input.bool(true, "Open perso 2", group=g_ct)
+c2_hm   = input.string("09:30", "Heure 2 (HH:MM)", group=g_ct)
+c2_col  = input.color(#e53935, "Couleur 2", group=g_ct)
+c3_on   = input.bool(false, "Open perso 3", group=g_ct)
+c3_hm   = input.string("18:00", "Heure 3 (HH:MM)", group=g_ct)
+c3_col  = input.color(#8e24aa, "Couleur 3", group=g_ct)
+c_keep  = input.int(2, "Nombre conserve (perso)", minval=1, maxval=20, group=g_ct)
+
+// ─── INPUTS : GAPS D'OUVERTURE ────────────────────────────────────────────────
+g_gap    = "5 • Gaps d'ouverture"
+ndog_on  = input.bool(true,  "NDOG — New Day Opening Gap", group=g_gap)
+nwog_on  = input.bool(true,  "NWOG — New Week Opening Gap", group=g_gap)
+gap_fill = input.color(color.new(#ffb74d, 55), "Fond des gaps", group=g_gap)
+gap_bord = input.color(color.new(#ef6c00, 10), "Bordure des gaps", group=g_gap)
+gap_ext  = input.int(120, "Longueur des boites (bougies)", minval=1, maxval=500, group=g_gap)
+gap_keep = input.int(3, "Nombre de gaps conserves (par type)", minval=1, maxval=20, group=g_gap)
+
+// ─── INPUTS : TIMER ───────────────────────────────────────────────────────────
+g_tm     = "6 • Timer"
+tm_on    = input.bool(true, "Afficher le compte a rebours", group=g_tm)
+tm_pre   = input.string("TF: ", "Prefixe", group=g_tm)
+tm_pos   = input.string("Bas centre", "Position", options=["Bas centre", "Bas droite", "Haut centre", "Milieu droite"], group=g_tm)
+tm_col   = input.color(color.new(color.black, 0), "Couleur du texte", group=g_tm)
+tm_bg    = input.color(color.new(color.white, 10), "Couleur du fond", group=g_tm)
+
+tm_p = switch tm_pos
+    "Bas centre"    => position.bottom_center
+    "Bas droite"    => position.bottom_right
+    "Haut centre"   => position.top_center
+    => position.middle_right
+
+atr14 = ta.atr(14)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  1 + 2.  FVG / IFVG  et  ORDER BLOCKS
+// ═════════════════════════════════════════════════════════════════════════════
+var array<box>   f_box = array.new<box>()
+var array<label> f_lab = array.new<label>()
+var array<float> f_top = array.new<float>()
+var array<float> f_bot = array.new<float>()
+var array<int>   f_dir = array.new<int>()   //  1 = FVG haussier a l'origine
+var array<int>   f_st  = array.new<int>()   //  0 = FVG, 1 = IFVG, 2 = mort
+
+min_gap  = fvg_atr > 0 ? atr14 * fvg_atr : 0.0
+fvg_up   = low > high[2] and (low - high[2]) >= min_gap
+fvg_dn   = high < low[2] and (low[2] - high) >= min_gap
+
+add_fvg(top, bot, dir) =>
+    bx = box.new(bar_index - 2, top, bar_index + fvg_ext, bot, border_color=fvg_bord, bgcolor=fvg_fill, border_width=1)
+    lb = label.new(bar_index + fvg_ext, math.avg(top, bot), "", style=label.style_none, textcolor=ifvg_bord, size=txt_sz)
+    array.push(f_box, bx)
+    array.push(f_lab, lb)
+    array.push(f_top, top)
+    array.push(f_bot, bot)
+    array.push(f_dir, dir)
+    array.push(f_st, 0)
+    if array.size(f_box) > fvg_keep
+        box.delete(array.shift(f_box))
+        label.delete(array.shift(f_lab))
+        array.shift(f_top)
+        array.shift(f_bot)
+        array.shift(f_dir)
+        array.shift(f_st)
+    true
+
+if show_fvg and fvg_up
+    add_fvg(low, high[2], 1)
+if show_fvg and fvg_dn
+    add_fvg(low[2], high, -1)
+
+// Transition FVG -> IFVG -> mort
+if array.size(f_box) > 0
+    k = array.size(f_box) - 1
+    while k >= 0
+        st  = array.get(f_st, k)
+        if st < 2
+            top = array.get(f_top, k)
+            bot = array.get(f_bot, k)
+            dir = array.get(f_dir, k)
+            bx  = array.get(f_box, k)
+            lb  = array.get(f_lab, k)
+            if st == 0
+                filled = dir > 0 ? close < bot : close > top
+                if filled
+                    if show_ifvg
+                        array.set(f_st, k, 1)
+                        box.set_bgcolor(bx, ifvg_fill)
+                        box.set_border_color(bx, ifvg_bord)
+                        box.set_border_width(bx, 2)
+                        label.set_text(lb, ifvg_txt)
+                    else
+                        array.set(f_st, k, 2)
+                        box.delete(bx)
+                        label.delete(lb)
+            else
+                dead = dir > 0 ? close > top : close < bot
+                if dead
+                    array.set(f_st, k, 2)
+                    box.delete(bx)
+                    label.delete(lb)
+        k -= 1
+
+// ─── Order Blocks issus du deplacement ────────────────────────────────────────
+var array<box>   o_box = array.new<box>()
+var array<float> o_top = array.new<float>()
+var array<float> o_bot = array.new<float>()
+var array<int>   o_dir = array.new<int>()
+var array<bool>  o_liv = array.new<bool>()
+
+find_ob(wantBear, maxlb) =>
+    idx = -1
+    for k = 2 to maxlb
+        isBear = close[k] < open[k]
+        isBull = close[k] > open[k]
+        if (wantBear and isBear) or (not wantBear and isBull)
+            idx := k
+            break
+    idx
+
+add_ob(idx, dir) =>
+    t = ob_body ? math.max(open[idx], close[idx]) : high[idx]
+    b = ob_body ? math.min(open[idx], close[idx]) : low[idx]
+    bx = box.new(bar_index - idx, t, bar_index + ob_ext, b, border_color=ob_bord, bgcolor=ob_fill, border_width=1)
+    array.push(o_box, bx)
+    array.push(o_top, t)
+    array.push(o_bot, b)
+    array.push(o_dir, dir)
+    array.push(o_liv, true)
+    if array.size(o_box) > ob_keep
+        box.delete(array.shift(o_box))
+        array.shift(o_top)
+        array.shift(o_bot)
+        array.shift(o_dir)
+        array.shift(o_liv)
+    true
+
+if show_ob and fvg_up
+    i_ob = find_ob(true, ob_lb)
+    if i_ob > 0
+        add_ob(i_ob, 1)
+if show_ob and fvg_dn
+    i_ob2 = find_ob(false, ob_lb)
+    if i_ob2 > 0
+        add_ob(i_ob2, -1)
+
+if array.size(o_box) > 0
+    m = array.size(o_box) - 1
+    while m >= 0
+        if array.get(o_liv, m)
+            mit = array.get(o_dir, m) > 0 ? close < array.get(o_bot, m) : close > array.get(o_top, m)
+            if mit
+                array.set(o_liv, m, false)
+                if ob_del
+                    box.delete(array.get(o_box, m))
+                else
+                    box.set_bgcolor(array.get(o_box, m), color.new(color.gray, 85))
+                    box.set_border_color(array.get(o_box, m), color.new(color.gray, 50))
+        m -= 1
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  3. SESSIONS
+// ═════════════════════════════════════════════════════════════════════════════
+sess_eng(en, nm, started, ins, ended, col, showBox, showLvl) =>
+    var float sh = na
+    var float sl = na
+    var int   sx = na
+    var box   bx = na
+    var array<line>  lns = array.new<line>()
+    var array<label> lbs = array.new<label>()
+    if en
+        if started
+            sh := high
+            sl := low
+            sx := bar_index
+            if showBox
+                bx := box.new(bar_index, high, bar_index, low, border_color=color.new(col, 55), bgcolor=color.new(col, 92), border_width=1)
+        else if ins
+            sh := na(sh) ? high : math.max(sh, high)
+            sl := na(sl) ? low  : math.min(sl, low)
+            if showBox and not na(bx)
+                box.set_right(bx, bar_index)
+                box.set_top(bx, sh)
+                box.set_bottom(bx, sl)
+        if ended and showLvl and not na(sh)
+            xr = bar_index + s_ext
+            array.push(lns, line.new(sx, sh, xr, sh, color=col, width=1))
+            array.push(lbs, label.new(xr, sh, nm + " High", style=label.style_none, textcolor=col, size=txt_sz))
+            array.push(lns, line.new(sx, sl, xr, sl, color=col, width=1))
+            array.push(lbs, label.new(xr, sl, nm + " Low", style=label.style_none, textcolor=col, size=txt_sz))
+            while array.size(lns) > s_keep * 2
+                line.delete(array.shift(lns))
+                label.delete(array.shift(lbs))
+    true
+
+// Les drapeaux de session sont calcules au niveau global : referencer
+// l'historique d'une variable locale a une fonction n'est pas fiable en Pine.
+s1_raw = not na(time(timeframe.period, s1_ss, tz))
+s2_raw = not na(time(timeframe.period, s2_ss, tz))
+s3_raw = not na(time(timeframe.period, s3_ss, tz))
+s4_raw = not na(time(timeframe.period, s4_ss, tz))
+
+sess_eng(s1_on, s1_nm, s1_raw and not s1_raw[1], s1_raw, not s1_raw and s1_raw[1], s1_col, s1_box, s1_lvl)
+sess_eng(s2_on, s2_nm, s2_raw and not s2_raw[1], s2_raw, not s2_raw and s2_raw[1], s2_col, s2_box, s2_lvl)
+sess_eng(s3_on, s3_nm, s3_raw and not s3_raw[1], s3_raw, not s3_raw and s3_raw[1], s3_col, s3_box, s3_lvl)
+sess_eng(s4_on, s4_nm, s4_raw and not s4_raw[1], s4_raw, not s4_raw and s4_raw[1], s4_col, s4_box, s4_lvl)
+
+
+bgcolor(s1_on and s1_shade and s1_raw ? color.new(s1_col, 90) : na, title="Killzone 1")
+bgcolor(s2_on and s2_shade and s2_raw ? color.new(s2_col, 90) : na, title="Killzone 2")
+bgcolor(s3_on and s3_shade and s3_raw ? color.new(s3_col, 90) : na, title="Killzone 3")
+bgcolor(s4_on and s4_shade and s4_raw ? color.new(s4_col, 90) : na, title="Killzone 4")
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  4. OPENS  (théorie des quarts)
+// ═════════════════════════════════════════════════════════════════════════════
+// Minutes ecoulees depuis 18:00 heure de reference (debut du cycle journalier).
+ny_h = hour(time, tz)
+ny_m = minute(time, tz)
+mins = ny_h * 60 + ny_m
+msd  = (mins - 1080 + 1440) % 1440
+
+dq   = math.floor(msd / 360.0)          // quart de journee    : 0..3
+c90  = math.floor(msd / 90.0)           // cycle 90 min        : 0..15
+q90  = math.floor((msd % 90) / 22.5)    // quart du cycle 90   : 0..3
+qmi  = math.floor((msd % 22.5) / 5.625) // quart du micro cycle: 0..3
+
+trig_tdo = dq == 1 and dq[1] != 1       // True Day Open  = ouverture du Q2 du jour
+trig_90  = c90 != c90[1]                // ouverture du cycle 90 min
+trig_t90 = q90 == 1 and q90[1] != 1     // True 90 Open   = ouverture du Q2 du cycle 90
+trig_tmo = qmi == 1 and qmi[1] != 1     // True Micro Open= ouverture du Q2 du micro
+
+open_eng(en, nm, trig, col, sty, keep) =>
+    var array<line>  ls = array.new<line>()
+    var array<label> lb = array.new<label>()
+    if en and trig
+        xr = bar_index + op_ext
+        array.push(ls, line.new(bar_index, open, xr, open, color=col, width=1, style=sty))
+        array.push(lb, label.new(xr, open, op_txt ? nm : "", style=label.style_none, textcolor=col, size=txt_sz))
+        while array.size(ls) > keep
+            line.delete(array.shift(ls))
+            label.delete(array.shift(lb))
+    true
+
+open_eng(tdo_on, "TDO",     trig_tdo, tdo_col, line.style_solid,  tdo_keep)
+open_eng(n90_on, "90mO",    trig_90,  n90_col, line.style_dotted, n90_keep)
+open_eng(t90_on, "T90",     trig_t90, t90_col, line.style_solid,  t90_keep)
+open_eng(tmo_on, "TMicroO", trig_tmo, tmo_col, line.style_solid,  tmo_keep)
+
+// ─── Opens personnalisés ──────────────────────────────────────────────────────
+parse_hm(s) =>
+    p   = str.split(s, ":")
+    out = -1.0
+    if array.size(p) == 2
+        out := nz(str.tonumber(array.get(p, 0))) * 60 + nz(str.tonumber(array.get(p, 1)))
+    out
+
+var float c1_min = parse_hm(c1_hm)
+var float c2_min = parse_hm(c2_hm)
+var float c3_min = parse_hm(c3_hm)
+
+cross_time(tgt) =>
+    tgt >= 0 and mins >= tgt and nz(mins[1], 9999) < tgt
+
+open_eng(c1_on, c1_hm, cross_time(c1_min), c1_col, line.style_solid, c_keep)
+open_eng(c2_on, c2_hm, cross_time(c2_min), c2_col, line.style_solid, c_keep)
+open_eng(c3_on, c3_hm, cross_time(c3_min), c3_col, line.style_solid, c_keep)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  5. GAPS D'OUVERTURE (NDOG / NWOG)
+// ═════════════════════════════════════════════════════════════════════════════
+new_day  = nz(ta.change(time("D")), 0) != 0
+new_week = nz(ta.change(time("W")), 0) != 0
+
+gap_eng(en, nm, trig, keep) =>
+    var array<box>   bs = array.new<box>()
+    var array<label> ls = array.new<label>()
+    if en and trig and bar_index > 0
+        t = math.max(close[1], open)
+        b = math.min(close[1], open)
+        if t > b
+            xr = bar_index + gap_ext
+            array.push(bs, box.new(bar_index - 1, t, xr, b, border_color=gap_bord, bgcolor=gap_fill, border_width=1))
+            array.push(ls, label.new(xr, math.avg(t, b), nm, style=label.style_none, textcolor=gap_bord, size=txt_sz))
+            while array.size(bs) > keep
+                box.delete(array.shift(bs))
+                label.delete(array.shift(ls))
+    true
+
+gap_eng(ndog_on, "NDOG", new_day  and not new_week, gap_keep)
+gap_eng(nwog_on, "NWOG", new_week, gap_keep)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  6. TIMER DE CLOTURE DE BOUGIE
+// ═════════════════════════════════════════════════════════════════════════════
+pad2(x) =>
+    (x < 10 ? "0" : "") + str.tostring(x)
+
+var table tm_tbl = table.new(tm_p, 1, 1, bgcolor=tm_bg, border_color=color.new(color.black, 40), border_width=1)
+
+if tm_on and barstate.islast
+    rem = math.max(0, (time_close - timenow) / 1000)
+    hh  = rem / 3600
+    mm  = (rem % 3600) / 60
+    ss  = rem % 60
+    body = hh > 0 ? pad2(hh) + ":" + pad2(mm) + ":" + pad2(ss) : pad2(mm) + ":" + pad2(ss)
+    table.cell(tm_tbl, 0, 0, tm_pre + body, text_color=tm_col, text_size=size.normal)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  7. ALERTES
+// ═════════════════════════════════════════════════════════════════════════════
+alertcondition(fvg_up, "FVG haussier", "FVG haussier sur {{ticker}} ({{interval}})")
+alertcondition(fvg_dn, "FVG baissier", "FVG baissier sur {{ticker}} ({{interval}})")

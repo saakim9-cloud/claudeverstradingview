@@ -1,0 +1,481 @@
+//@version=5
+// ═════════════════════════════════════════════════════════════════════════════
+//  CISD / TCISD + MSS  —  Smart Money Structure Toolkit
+// ─────────────────────────────────────────────────────────────────────────────
+//  CISD  (Change In State of Delivery)
+//        Fin d'une sequence de bougies de meme sens (la "jambe de livraison").
+//        Niveau CISD = OPEN de la PREMIERE bougie de cette sequence.
+//        CISD haussier : cloture AU-DESSUS de l'open de la 1ere bougie de la
+//                        derniere sequence de bougies baissieres. Et inversement.
+//
+//  TCISD (True CISD)
+//        Le CISD ancre sur l'EXTREME de la jambe (la sequence qui a fabrique le
+//        plus bas / plus haut courant), valide par :
+//          - une prise de liquidite sur cet extreme (sweep)   [optionnel]
+//          - un deplacement significatif (bougie >= k x ATR)  [optionnel]
+//        C'est le CISD qui marque le vrai retournement de livraison, et non un
+//        simple bruit a l'interieur de la jambe.
+//
+//  MSS / BOS
+//        Cassure en cloture d'un swing confirme :
+//          - contre la tendance en cours -> MSS (Market Structure Shift)
+//          - dans le sens de la tendance -> BOS (Break Of Structure)
+//
+//  SETUP A+
+//        MSS et TCISD de meme sens a l'interieur d'une fenetre de confluence,
+//        filtres par le biais HTF et la session.
+// ═════════════════════════════════════════════════════════════════════════════
+
+indicator(
+     title            = "CISD / TCISD + MSS",
+     shorttitle       = "CISD•TCISD•MSS",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 500
+ )
+
+// ─── INPUTS : STRUCTURE ───────────────────────────────────────────────────────
+g_str        = "1 • Structure (MSS / BOS)"
+swing_len    = input.int(5, "Longueur des swings (pivots)", minval=1, maxval=50, group=g_str, tooltip="Bougies a gauche/droite pour confirmer un pivot. Plus grand = structure plus lente et plus fiable.")
+show_mss     = input.bool(true,  "Afficher les MSS (retournement)", group=g_str)
+show_bos     = input.bool(true,  "Afficher les BOS (continuation)", group=g_str)
+req_sweep_ms = input.bool(false, "Exiger un sweep avant un MSS", group=g_str, tooltip="Si actif, une cassure contre-tendance n'est etiquetee MSS que si la liquidite opposee a ete prise recemment.")
+sweep_mem    = input.int(15, "Memoire du sweep (bougies)", minval=1, maxval=200, group=g_str)
+show_sweep   = input.bool(true,  "Marquer les prises de liquidite", group=g_str)
+show_swings  = input.bool(false, "Afficher les swings bruts", group=g_str)
+
+// ─── INPUTS : CISD ────────────────────────────────────────────────────────────
+g_cisd       = "2 • CISD"
+show_cisd    = input.bool(true, "Afficher les CISD", group=g_cisd)
+min_run      = input.int(1, "Bougies minimum dans la jambe", minval=1, maxval=20, group=g_cisd, tooltip="Nombre minimum de bougies consecutives de meme sens pour qu'une jambe de livraison soit valide.")
+cisd_keep    = input.int(8, "Nombre de niveaux conserves a l'ecran", minval=1, maxval=50, group=g_cisd)
+cisd_extend  = input.bool(true, "Prolonger les niveaux jusqu'a invalidation", group=g_cisd)
+cisd_max_ext = input.int(120, "Extension maximum (bougies)", minval=5, maxval=500, group=g_cisd)
+
+// ─── INPUTS : TCISD ───────────────────────────────────────────────────────────
+g_tcisd      = "3 • TCISD (True CISD)"
+show_tcisd   = input.bool(true, "Afficher les TCISD", group=g_tcisd)
+t_req_sweep  = input.bool(true, "Exiger une prise de liquidite", group=g_tcisd, tooltip="L'extreme de la jambe doit avoir balaye un swing precedent.")
+t_req_disp   = input.bool(true, "Exiger un deplacement (ATR)", group=g_tcisd)
+t_disp_mult  = input.float(1.0, "Deplacement minimum (x ATR)", minval=0.1, step=0.1, group=g_tcisd)
+atr_len      = input.int(14, "Longueur ATR", minval=1, group=g_tcisd)
+
+// ─── INPUTS : FILTRES ─────────────────────────────────────────────────────────
+g_flt        = "4 • Filtres"
+use_htf      = input.bool(false, "Filtre biais HTF", group=g_flt)
+htf_tf       = input.timeframe("60", "Unite de temps HTF", group=g_flt)
+htf_len      = input.int(50, "EMA du biais HTF", minval=1, group=g_flt)
+use_sess     = input.bool(false, "Filtre session", group=g_flt)
+sess_str     = input.session("0700-1600", "Session (heure de l'exchange)", group=g_flt)
+show_sess_bg = input.bool(false, "Colorer la session", group=g_flt)
+
+// ─── INPUTS : SETUP A+ ────────────────────────────────────────────────────────
+g_setup      = "5 • Setup A+ (MSS + TCISD)"
+show_setup   = input.bool(true, "Afficher les setups A+", group=g_setup)
+setup_window = input.int(10, "Fenetre de confluence (bougies)", minval=1, maxval=100, group=g_setup, tooltip="Ecart maximum entre le MSS et le TCISD pour valider le setup.")
+
+// ─── INPUTS : VISUEL ──────────────────────────────────────────────────────────
+g_vis        = "6 • Visuel"
+col_bull     = input.color(#089981, "Couleur haussiere", group=g_vis)
+col_bear     = input.color(#f23645, "Couleur baissiere", group=g_vis)
+col_dead     = input.color(color.new(color.gray, 55), "Couleur invalidee", group=g_vis)
+lbl_size     = input.string("tiny", "Taille des etiquettes", options=["tiny", "small", "normal", "large"], group=g_vis)
+show_panel   = input.bool(true, "Afficher le tableau de bord", group=g_vis)
+panel_pos    = input.string("Haut droite", "Position du tableau", options=["Haut droite", "Haut gauche", "Bas droite", "Bas gauche", "Milieu droite"], group=g_vis)
+
+lbl_sz = switch lbl_size
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+    => size.large
+
+tbl_pos = switch panel_pos
+    "Haut droite" => position.top_right
+    "Haut gauche" => position.top_left
+    "Bas droite"  => position.bottom_right
+    "Bas gauche"  => position.bottom_left
+    => position.middle_right
+
+// ─── CONTEXTE ─────────────────────────────────────────────────────────────────
+atr      = ta.atr(atr_len)
+htf_ema  = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_len), barmerge.gaps_off, barmerge.lookahead_off)
+htf_bias = not use_htf ? 0 : close > htf_ema ? 1 : close < htf_ema ? -1 : 0
+sess_now = not na(time(timeframe.period, sess_str))
+in_sess  = not use_sess or sess_now
+bgcolor(show_sess_bg and sess_now ? color.new(color.yellow, 94) : na, title="Session")
+
+bull_bar = close > open
+bear_bar = close < open
+disp_ok  = not t_req_disp or (high - low) >= atr * t_disp_mult
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  1. SWINGS & LIQUIDITE
+// ═════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, swing_len, swing_len)
+pl = ta.pivotlow(low, swing_len, swing_len)
+
+// Pools de liquidite encore intacts (swings jamais traverses)
+var array<float> pool_hi = array.new<float>()
+var array<float> pool_lo = array.new<float>()
+
+// Swing de reference pour la cassure de structure
+var float ref_hi   = na
+var int   ref_hi_x = na
+var float ref_lo   = na
+var int   ref_lo_x = na
+
+if not na(ph)
+    array.push(pool_hi, ph)
+    ref_hi   := ph
+    ref_hi_x := bar_index - swing_len
+    if show_swings
+        label.new(bar_index - swing_len, ph, "H", style=label.style_label_down, color=color.new(col_bear, 80), textcolor=col_bear, size=size.tiny)
+
+if not na(pl)
+    array.push(pool_lo, pl)
+    ref_lo   := pl
+    ref_lo_x := bar_index - swing_len
+    if show_swings
+        label.new(bar_index - swing_len, pl, "L", style=label.style_label_up, color=color.new(col_bull, 80), textcolor=col_bull, size=size.tiny)
+
+if array.size(pool_hi) > 30
+    array.shift(pool_hi)
+if array.size(pool_lo) > 30
+    array.shift(pool_lo)
+
+// Un sweep = la meche traverse le pool puis la cloture revient a l'interieur.
+// Le pool traverse est consomme dans tous les cas (la liquidite a ete prise).
+var int last_sweep_lo_x = na   // liquidite BASSE prise  -> carburant haussier
+var int last_sweep_hi_x = na   // liquidite HAUTE prise  -> carburant baissier
+sweep_lo = false
+sweep_hi = false
+
+il = array.size(pool_lo) - 1
+while il >= 0
+    lvl_l = array.get(pool_lo, il)
+    if low < lvl_l
+        if close > lvl_l
+            sweep_lo := true
+        array.remove(pool_lo, il)
+    il -= 1
+
+ih = array.size(pool_hi) - 1
+while ih >= 0
+    lvl_h = array.get(pool_hi, ih)
+    if high > lvl_h
+        if close < lvl_h
+            sweep_hi := true
+        array.remove(pool_hi, ih)
+    ih -= 1
+
+if sweep_lo
+    last_sweep_lo_x := bar_index
+    if show_sweep
+        label.new(bar_index, low, "✕", style=label.style_label_up, yloc=yloc.belowbar, color=color.new(col_bull, 70), textcolor=col_bull, size=size.tiny, tooltip="Liquidite basse prise (sell-side sweep)")
+
+if sweep_hi
+    last_sweep_hi_x := bar_index
+    if show_sweep
+        label.new(bar_index, high, "✕", style=label.style_label_down, yloc=yloc.abovebar, color=color.new(col_bear, 70), textcolor=col_bear, size=size.tiny, tooltip="Liquidite haute prise (buy-side sweep)")
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  2. JAMBES DE LIVRAISON (moteur CISD)
+// ═════════════════════════════════════════════════════════════════════════════
+// Sequence baissiere -> fournit le niveau d'un CISD haussier
+var bool  bear_on   = false
+var float bear_open = na
+var int   bear_x    = na
+var float bear_low  = na
+var int   bear_len  = 0
+var bool  bear_used = false
+
+// Sequence haussiere -> fournit le niveau d'un CISD baissier
+var bool  bull_on   = false
+var float bull_open = na
+var int   bull_x    = na
+var float bull_high = na
+var int   bull_len  = 0
+var bool  bull_used = false
+
+if bear_bar
+    if bear_on
+        bear_low := math.min(bear_low, low)
+        bear_len += 1
+    else
+        bear_on   := true
+        bear_open := open
+        bear_x    := bar_index
+        bear_low  := low
+        bear_len  := 1
+        bear_used := false
+    bull_on := false
+else if bull_bar
+    if bull_on
+        bull_high := math.max(bull_high, high)
+        bull_len  += 1
+    else
+        bull_on   := true
+        bull_open := open
+        bull_x    := bar_index
+        bull_high := high
+        bull_len  := 1
+        bull_used := false
+    bear_on := false
+
+// Ancrage sur l'EXTREME de la jambe (moteur TCISD)
+var float leg_lo       = na
+var float leg_lo_open  = na
+var int   leg_lo_x     = na
+var bool  leg_lo_swept = false
+var bool  leg_lo_used  = false
+
+var float leg_hi       = na
+var float leg_hi_open  = na
+var int   leg_hi_x     = na
+var bool  leg_hi_swept = false
+var bool  leg_hi_used  = false
+
+if bear_on and (na(leg_lo) or bear_low < leg_lo)
+    leg_lo       := bear_low
+    leg_lo_open  := bear_open
+    leg_lo_x     := bear_x
+    leg_lo_used  := false
+    leg_lo_swept := false
+
+if bear_on and sweep_lo
+    leg_lo_swept := true
+
+if bull_on and (na(leg_hi) or bull_high > leg_hi)
+    leg_hi       := bull_high
+    leg_hi_open  := bull_open
+    leg_hi_x     := bull_x
+    leg_hi_used  := false
+    leg_hi_swept := false
+
+if bull_on and sweep_hi
+    leg_hi_swept := true
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  3. SIGNAUX CISD / TCISD
+// ═════════════════════════════════════════════════════════════════════════════
+cisd_bull_raw = not bear_on and not bear_used and not na(bear_open) and bear_len >= min_run and close > bear_open
+cisd_bear_raw = not bull_on and not bull_used and not na(bull_open) and bull_len >= min_run and close < bull_open
+
+tcisd_ok_bull = not t_req_sweep or leg_lo_swept
+tcisd_ok_bear = not t_req_sweep or leg_hi_swept
+
+tcisd_bull_raw = not leg_lo_used and not na(leg_lo_open) and close > leg_lo_open and disp_ok and tcisd_ok_bull
+tcisd_bear_raw = not leg_hi_used and not na(leg_hi_open) and close < leg_hi_open and disp_ok and tcisd_ok_bear
+
+cisd_bull  = show_cisd  and cisd_bull_raw  and in_sess
+cisd_bear  = show_cisd  and cisd_bear_raw  and in_sess
+tcisd_bull = show_tcisd and tcisd_bull_raw and in_sess
+tcisd_bear = show_tcisd and tcisd_bear_raw and in_sess
+
+// Consommation des etats (independante de l'affichage pour rester coherent)
+if cisd_bull_raw
+    bear_used := true
+if cisd_bear_raw
+    bull_used := true
+if tcisd_bull_raw
+    leg_lo_used := true
+    leg_lo      := na
+if tcisd_bear_raw
+    leg_hi_used := true
+    leg_hi      := na
+
+var int last_tcisd_bull_x = na
+var int last_tcisd_bear_x = na
+if tcisd_bull
+    last_tcisd_bull_x := bar_index
+if tcisd_bear
+    last_tcisd_bear_x := bar_index
+
+// ─── Rendu des niveaux CISD / TCISD ───────────────────────────────────────────
+var array<line>  c_line = array.new<line>()
+var array<label> c_lab  = array.new<label>()
+var array<float> c_lvl  = array.new<float>()
+var array<int>   c_dir  = array.new<int>()
+var array<bool>  c_live = array.new<bool>()
+var array<int>   c_from = array.new<int>()
+
+draw_cisd(lvl, x1, dir, is_true) =>
+    col = dir > 0 ? col_bull : col_bear
+    ln  = line.new(x1, lvl, bar_index, lvl, color=col, width=is_true ? 2 : 1, style=is_true ? line.style_solid : line.style_dashed)
+    txt = is_true ? (dir > 0 ? "TCISD ▲" : "TCISD ▼") : "CISD"
+    lb  = label.new(bar_index, lvl, txt, style=dir > 0 ? label.style_label_up : label.style_label_down, color=color.new(col, is_true ? 15 : 60), textcolor=is_true ? color.white : col, size=lbl_sz)
+    array.push(c_line, ln)
+    array.push(c_lab, lb)
+    array.push(c_lvl, lvl)
+    array.push(c_dir, dir)
+    array.push(c_live, true)
+    array.push(c_from, bar_index)
+    if array.size(c_line) > cisd_keep
+        line.delete(array.shift(c_line))
+        label.delete(array.shift(c_lab))
+        array.shift(c_lvl)
+        array.shift(c_dir)
+        array.shift(c_live)
+        array.shift(c_from)
+    true
+
+if tcisd_bull
+    draw_cisd(leg_lo_open, nz(leg_lo_x, bar_index), 1, true)
+else if cisd_bull
+    draw_cisd(bear_open, nz(bear_x, bar_index), 1, false)
+
+if tcisd_bear
+    draw_cisd(leg_hi_open, nz(leg_hi_x, bar_index), -1, true)
+else if cisd_bear
+    draw_cisd(bull_open, nz(bull_x, bar_index), -1, false)
+
+if cisd_extend and array.size(c_line) > 0
+    for i = 0 to array.size(c_line) - 1
+        if array.get(c_live, i)
+            lv = array.get(c_lvl, i)
+            dr = array.get(c_dir, i)
+            broken = dr > 0 ? close < lv : close > lv
+            expired = bar_index - array.get(c_from, i) > cisd_max_ext
+            line.set_x2(array.get(c_line, i), bar_index)
+            if broken or expired
+                array.set(c_live, i, false)
+                line.set_color(array.get(c_line, i), col_dead)
+                line.set_style(array.get(c_line, i), line.style_dotted)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  4. MSS / BOS
+// ═════════════════════════════════════════════════════════════════════════════
+var int    trend           = 0     //  1 = haussier, -1 = baissier, 0 = indetermine
+var int    last_mss_bull_x = na
+var int    last_mss_bear_x = na
+var string last_struct     = "—"
+var int    last_struct_dir = 0
+
+sweep_fresh_lo = not na(last_sweep_lo_x) and bar_index - last_sweep_lo_x <= sweep_mem
+sweep_fresh_hi = not na(last_sweep_hi_x) and bar_index - last_sweep_hi_x <= sweep_mem
+
+break_up   = not na(ref_hi) and close > ref_hi and in_sess
+break_down = not na(ref_lo) and close < ref_lo and in_sess
+
+mss_bull = false
+bos_bull = false
+mss_bear = false
+bos_bear = false
+
+if break_up
+    is_rev   = trend != 1
+    ok_sweep = not req_sweep_ms or sweep_fresh_lo
+    if is_rev and ok_sweep
+        mss_bull := true
+    else
+        bos_bull := true
+    if (mss_bull and show_mss) or (bos_bull and show_bos)
+        line.new(nz(ref_hi_x, bar_index), ref_hi, bar_index, ref_hi, color=col_bull, width=1, style=line.style_dashed)
+        label.new(bar_index, ref_hi, mss_bull ? "MSS ▲" : "BOS ▲", style=label.style_label_down, color=color.new(col_bull, 20), textcolor=color.white, size=lbl_sz)
+    trend           := 1
+    last_struct     := mss_bull ? "MSS haussier" : "BOS haussier"
+    last_struct_dir := 1
+    if mss_bull
+        last_mss_bull_x := bar_index
+    ref_hi   := na
+    ref_hi_x := na
+
+if break_down
+    is_rev   = trend != -1
+    ok_sweep = not req_sweep_ms or sweep_fresh_hi
+    if is_rev and ok_sweep
+        mss_bear := true
+    else
+        bos_bear := true
+    if (mss_bear and show_mss) or (bos_bear and show_bos)
+        line.new(nz(ref_lo_x, bar_index), ref_lo, bar_index, ref_lo, color=col_bear, width=1, style=line.style_dashed)
+        label.new(bar_index, ref_lo, mss_bear ? "MSS ▼" : "BOS ▼", style=label.style_label_up, color=color.new(col_bear, 20), textcolor=color.white, size=lbl_sz)
+    trend           := -1
+    last_struct     := mss_bear ? "MSS baissier" : "BOS baissier"
+    last_struct_dir := -1
+    if mss_bear
+        last_mss_bear_x := bar_index
+    ref_lo   := na
+    ref_lo_x := na
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  5. SETUP A+ : MSS + TCISD dans la fenetre de confluence
+// ═════════════════════════════════════════════════════════════════════════════
+pair_bull = not na(last_mss_bull_x) and not na(last_tcisd_bull_x)
+pair_bear = not na(last_mss_bear_x) and not na(last_tcisd_bear_x)
+
+gap_bull  = pair_bull ? math.abs(last_mss_bull_x - last_tcisd_bull_x) : na
+gap_bear  = pair_bear ? math.abs(last_mss_bear_x - last_tcisd_bear_x) : na
+
+fresh_bull = pair_bull and math.max(last_mss_bull_x, last_tcisd_bull_x) == bar_index
+fresh_bear = pair_bear and math.max(last_mss_bear_x, last_tcisd_bear_x) == bar_index
+
+conf_bull = fresh_bull and gap_bull <= setup_window
+conf_bear = fresh_bear and gap_bear <= setup_window
+
+setup_long  = show_setup and conf_bull and (not use_htf or htf_bias >= 0) and in_sess
+setup_short = show_setup and conf_bear and (not use_htf or htf_bias <= 0) and in_sess
+
+plotshape(setup_long,  title="Setup LONG",  style=shape.triangleup,   location=location.belowbar, color=col_bull, size=size.small)
+plotshape(setup_short, title="Setup SHORT", style=shape.triangledown, location=location.abovebar, color=col_bear, size=size.small)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  6. TABLEAU DE BORD
+// ═════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(tbl_pos, 2, 7, bgcolor=color.new(color.black, 82), border_color=color.new(color.gray, 60), border_width=1)
+
+row(r, k, v, c) =>
+    table.cell(dash, 0, r, k, text_color=color.silver, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, v, text_color=c, text_size=size.small, text_halign=text.align_right)
+
+if show_panel and barstate.islast
+    table.cell(dash, 0, 0, "CISD • TCISD • MSS", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, timeframe.period, text_color=color.white, text_size=size.small, text_halign=text.align_right)
+
+    t_txt = trend == 1 ? "HAUSSIERE" : trend == -1 ? "BAISSIERE" : "NEUTRE"
+    t_col = trend == 1 ? col_bull : trend == -1 ? col_bear : color.gray
+    row(1, "Tendance", t_txt, t_col)
+
+    s_col = last_struct_dir == 1 ? col_bull : last_struct_dir == -1 ? col_bear : color.gray
+    row(2, "Structure", last_struct, s_col)
+
+    tb = na(last_tcisd_bull_x) ? -1 : bar_index - last_tcisd_bull_x
+    ts = na(last_tcisd_bear_x) ? -1 : bar_index - last_tcisd_bear_x
+    tc_none = tb < 0 and ts < 0
+    tc_up   = not tc_none and (ts < 0 or (tb >= 0 and tb <= ts))
+    tc_age  = tc_up ? tb : ts
+    tc_txt  = tc_none ? "aucun" : (tc_up ? "▲" : "▼") + " il y a " + str.tostring(tc_age) + " b."
+    tc_col  = tc_none ? color.gray : tc_up ? col_bull : col_bear
+    row(3, "Dernier TCISD", tc_txt, tc_col)
+
+    h_txt = not use_htf ? "off" : htf_bias == 1 ? "▲ " + htf_tf : htf_bias == -1 ? "▼ " + htf_tf : "plat"
+    h_col = not use_htf ? color.gray : htf_bias == 1 ? col_bull : htf_bias == -1 ? col_bear : color.gray
+    row(4, "Biais HTF", h_txt, h_col)
+
+    e_txt = not use_sess ? "off" : sess_now ? "ACTIVE" : "FERMEE"
+    e_col = not use_sess ? color.gray : sess_now ? col_bull : col_bear
+    row(5, "Session", e_txt, e_col)
+
+    row(6, "ATR " + str.tostring(atr_len), str.tostring(atr, format.mintick), color.white)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  7. ALERTES
+// ═════════════════════════════════════════════════════════════════════════════
+alertcondition(cisd_bull,   "CISD haussier",         "CISD haussier sur {{ticker}} ({{interval}})")
+alertcondition(cisd_bear,   "CISD baissier",         "CISD baissier sur {{ticker}} ({{interval}})")
+alertcondition(tcisd_bull,  "TCISD haussier",        "TCISD haussier (vrai CISD) sur {{ticker}} ({{interval}})")
+alertcondition(tcisd_bear,  "TCISD baissier",        "TCISD baissier (vrai CISD) sur {{ticker}} ({{interval}})")
+alertcondition(mss_bull,    "MSS haussier",          "MSS haussier sur {{ticker}} ({{interval}})")
+alertcondition(mss_bear,    "MSS baissier",          "MSS baissier sur {{ticker}} ({{interval}})")
+alertcondition(bos_bull,    "BOS haussier",          "BOS haussier sur {{ticker}} ({{interval}})")
+alertcondition(bos_bear,    "BOS baissier",          "BOS baissier sur {{ticker}} ({{interval}})")
+alertcondition(sweep_lo,    "Sweep liquidite basse", "Prise de liquidite basse sur {{ticker}} ({{interval}})")
+alertcondition(sweep_hi,    "Sweep liquidite haute", "Prise de liquidite haute sur {{ticker}} ({{interval}})")
+alertcondition(setup_long,  "Setup A+ LONG",         "Setup A+ LONG (MSS + TCISD) sur {{ticker}} ({{interval}})")
+alertcondition(setup_short, "Setup A+ SHORT",        "Setup A+ SHORT (MSS + TCISD) sur {{ticker}} ({{interval}})")
+
+if setup_long
+    alert("Setup A+ LONG (MSS + TCISD) @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if setup_short
+    alert("Setup A+ SHORT (MSS + TCISD) @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)

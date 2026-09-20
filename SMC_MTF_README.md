@@ -1,94 +1,96 @@
 # SMC MTF Sniper — H4 → H1 → M15 → M5 → M1
 
-مؤشر TradingView (Pine v5) يطبّق تسلسل Smart Money متعدد الفريمات، ولا يُصدر إشارة
-**BUY / SELL** إلا عند توافق كل المراحل معاً.
+A TradingView indicator (Pine v5) that implements a multi-timeframe smart-money
+sequence and only prints a **BUY / SELL** signal when every stage lines up.
 
-الملف: `smc_mtf_sniper.pine`
+File: `smc_mtf_sniper.pine`
 
 ---
 
-## 1) تسلسل المراحل
+## 1) Stage sequence
 
-| الفريم | الوظيفة | ما يحسبه المؤشر |
+| TF | Role | What the script computes |
 |---|---|---|
-| **H4** | Bias + Structure | قمم/قيعان مؤكدة (pivots) + اتجاه عبر كسر الهيكل (BOS) → `BULL / BEAR / FLAT` |
-| **H1** | SNR / MSNR + POI | دعم ومقاومة قريب (SNR) ورئيسي (MSNR) + مناطق POI (Order Block قبل حركة اندفاعية) |
-| **M15** | CRT range + BSL/SSL | نطاق CRT = شمعة M15 السابقة (أو نقاط الانعكاس). `BSL` = سقف النطاق، `SSL` = قاعه، ثم كشف **Liquidity Sweep** |
-| **M5** | MSS / CHoCH + CISD / TCISD | كسر آخر قمة/قاع M5 في اتجاه الكنس (MSS/CHoCH) + كسر افتتاح سلسلة التسليم (CISD)، و**TCISD** = ابتلاع كامل ساق التسليم |
-| **M1** | Entry + Retest | يُشترط رجوع السعر لاختبار المستوى المكسور ثم شمعة تأكيد في اتجاه الصفقة |
+| **H4** | Bias + structure | Confirmed pivots + break of structure → `BULL / BEAR / FLAT` |
+| **H1** | SNR / MSNR + POI | Minor S/R (SNR) and major S/R (MSNR), plus POI zones (order block preceding an impulsive move) |
+| **M15** | CRT range + BSL/SSL | CRT range = previous M15 candle (or swing pivots). `BSL` = range high, `SSL` = range low, then **liquidity sweep** detection |
+| **M5** | MSS / CHoCH + CISD / TCISD | Break of the last M5 swing in the sweep direction (MSS / CHoCH) + break of the delivery-run open (CISD); **TCISD** = full engulf of the delivery leg |
+| **M1** | Entry + retest | Requires price to return and retest the broken level, then a confirmation candle |
 
-**الشرط الكامل للشراء:** `H4 صاعد` → `السعر عند POI طلب على H1` → `كنس SSL على M15 والإغلاق فوقه`
-→ `MSS/CISD صاعد مع Displacement على M5` → `Retest + شمعة تأكيد على M1`.
-البيع هو المرآة تماماً.
-
----
-
-## 2) الستوب والهدف
-
-- **SL**: خلف مرجع مختار من `SL anchor`
-  - `Sweep extreme` — خلف أقصى امتداد للكنس
-  - `M5 structure` — خلف قاع/قمة هيكل M5
-  - `Furthest of both` (افتراضي) — الأبعد بينهما
-  - يُضاف هامش `SL buffer × ATR`.
-- **TP**: أقرب سيولة مقابلة من بين: `BSL/SSL (M15)`, `SNR (H1)`, `MSNR (H1)`,
-  `H4 swing`, `قمة/قاع اليوم السابق` — بشرط تحقيق `Minimum R:R`.
-  إذا لم تتوفر سيولة مناسبة يُستخدم `Fallback R:R`.
+**Full long condition:** `H4 bullish` → `price at an H1 demand POI` → `SSL swept on M15 with a
+close back inside` → `bullish MSS/CISD with displacement on M5` → `retest + confirmation candle on M1`.
+Shorts are the exact mirror.
 
 ---
 
-## 3) الفلاتر الاختيارية
+## 2) Stop loss and take profit
 
-- **Volume**: `volume > SMA(volume) × mult`
-- **CVD**: دلتا تراكمية تقريبية من موقع الإغلاق داخل الشمعة (`math.sum` لآخر N شمعة)؛
-  الشراء يحتاج دلتا موجبة والبيع سالبة. (تقريب بدون بيانات داخل الشمعة، لذلك لا يعيد الرسم)
-- **Sessions**: لندن / نيويورك مع اختيار المنطقة الزمنية.
-
-كلها **مطفأة افتراضياً** — فعّلها من الإعدادات عند الحاجة.
-
----
-
-## 4) عدم إعادة الرسم (Non-repainting)
-
-- كل طلبات `request.security` تستخدم `lookahead_off`، وقيمتها **تُلتقط فقط لحظة إغلاق
-  شمعة الفريم الأعلى** (دالة `f_hold`)، فلا تتغيّر القيم التاريخية بأثر رجعي.
-- خيار `Confirm on bar close` مفعّل افتراضياً: الإشارات تُحسم عند إغلاق الشمعة فقط.
-- لا يوجد أي استخدام لبيانات مستقبلية.
-- **ملاحظة صريحة**: نقاط الـ pivot تحتاج `N` شمعة بعدها للتأكيد — هذا **تأخير مقصود**
-  وليس إعادة رسم؛ تقليل `pivot length` يسرّع التأكيد ويزيد الضجيج.
+- **SL** — anchored per the `SL anchor` setting:
+  - `Sweep extreme` — behind the furthest extension of the sweep
+  - `M5 structure` — behind the M5 structural low/high
+  - `Furthest of both` (default) — whichever is further
+  - An `SL buffer × ATR` margin is added on top.
+- **TP** — nearest opposing liquidity among `BSL/SSL (M15)`, `SNR (H1)`, `MSNR (H1)`,
+  `H4 swing`, and `previous day high/low`, subject to `Minimum R:R`.
+  If no level qualifies, `Fallback R:R` is used instead.
 
 ---
 
-## 5) التنبيهات
+## 3) Optional filters
 
-من نافذة Alerts في TradingView:
+- **Volume** — `volume > SMA(volume) × mult`
+- **CVD** — rolling signed-volume proxy from where each candle closes within its range
+  (`math.sum` over the last N bars); longs need positive delta, shorts negative.
+  It is an approximation that avoids intrabar data, which is why it does not repaint.
+- **Sessions** — London / New York with a configurable timezone.
 
-- `SMC BUY` / `SMC SELL` / `SMC ANY` — عبر `alertcondition`.
-- تنبيه `alert()` الديناميكي يُرسل نصاً يحتوي: الاتجاه، الرمز، الفريم، **Entry / SL / TP / R:R**
-  (اختر "Any alert() function call" عند إنشاء التنبيه).
+All three are **off by default** — enable them in the settings when you want them.
 
 ---
 
-## 6) طريقة الاستخدام
+## 4) Non-repainting
 
-1. افتح TradingView → Pine Editor → الصق محتوى `smc_mtf_sniper.pine` → **Add to chart**.
-2. **شغّل المؤشر على فريم M1** (أو M5 كحدّ أقصى). لوحة المعلومات تعرض `TOO HIGH`
-   إذا كان فريم الشارت أعلى من فريم الـ M5 المحدد.
-3. اضبط الفريمات من مجموعة `1 · Timeframes` إن أردت تركيبة أخرى
-   (مثال للسكالب السريع: 60 / 15 / 5 / 1 على شارت M1).
-4. راقب لوحة `STAGE` أعلى اليمين: تُظهر حالة كل مرحلة لكل اتجاه
-   (`SWEPT` → `SHIFTED` → مستوى الـ retest المنتظر).
+- Every `request.security` call uses `lookahead_off`, and its value is **latched only when the
+  higher-timeframe bar closes** (the `f_hold` helper), so historical values never change.
+- `Confirm on bar close` is enabled by default: signals resolve only at bar close.
+- No future data is referenced anywhere.
+- **Stated plainly:** pivots need `N` bars after them to confirm. That is **intentional lag**,
+  not repainting. Lowering `pivot length` confirms faster but adds noise.
 
-### ضبط سريع
-| الحالة | الإجراء |
+---
+
+## 5) Alerts
+
+From the TradingView alert dialog:
+
+- `SMC BUY` / `SMC SELL` / `SMC ANY` — via `alertcondition`.
+- A dynamic `alert()` message carrying direction, symbol, timeframe, and
+  **Entry / SL / TP / R:R** — pick "Any alert() function call" when creating the alert.
+
+---
+
+## 6) How to use
+
+1. TradingView → Pine Editor → paste `smc_mtf_sniper.pine` → **Add to chart**.
+2. **Run it on an M1 chart** (M5 at most). The dashboard shows `TOO HIGH` if the chart
+   timeframe is above the configured M5 timeframe.
+3. Adjust the timeframes in the `1 · Timeframes` group for a different stack
+   (e.g. faster scalping: 60 / 15 / 5 / 1 on an M1 chart).
+4. Watch the `STAGE` panel in the top right: it shows each stage per direction
+   (`SWEPT` → `SHIFTED` → the retest level being waited on).
+
+### Quick tuning
+| Symptom | What to change |
 |---|---|
-| إشارات قليلة جداً | قلّل `pivot length`، فعّل `Allow signals on neutral H4 bias`، أطفئ `Require TCISD`، أو اختر `Confirmation required = MSS or CISD` |
-| إشارات كثيرة/ضعيفة | فعّل `MSS and CISD`، ارفع `Displacement ATR multiple`، فعّل فلتر الجلسات و Volume |
-| الستوب يُضرب كثيراً | ارفع `SL buffer`، واستخدم `Furthest of both` |
+| Too few signals | Lower `pivot length`, enable `Allow signals on neutral H4 bias`, turn off `Require TCISD`, or set `Confirmation required = MSS or CISD` |
+| Too many / weak signals | Use `MSS and CISD`, raise `Displacement ATR multiple`, enable the session and volume filters |
+| Stops hit too often | Raise `SL buffer` and use `Furthest of both` |
 
 ---
 
-## 7) ملاحظة مهمة
+## 7) Important note
 
-هذا مؤشر تحليلي (Indicator) وليس نظام تنفيذ آلي، ولم يُختبر في محرّر Pine ضمن هذه الجلسة
-(لا يوجد مُصرّف Pine خارج TradingView). إن ظهر أي خطأ عند اللصق أرسل نص الخطأ ورقم السطر
-ليتم إصلاحه. لا تعتمد عليه بدون Backtest وForward test على رمزك وفريمك.
+This is an analysis indicator, not an execution system, and it was **not compiled in the Pine
+editor during this session** (no Pine compiler exists outside TradingView). If anything errors
+on paste, send the message and line number and it will be fixed. Backtest and forward-test on
+your own symbol and timeframe before relying on it.

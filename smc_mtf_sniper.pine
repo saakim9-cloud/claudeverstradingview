@@ -1,0 +1,570 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SMC MTF SNIPER  —  H4 → H1 → M15 → M5 → M1
+//  ─────────────────────────────────────────────────────────────────────────────
+//  تسلسل العمل / Workflow
+//    H4  : Bias + Structure                (BOS / اتجاه عام)
+//    H1  : SNR / MSNR + مناطق POI          (Order Blocks + دعوم ومقاومات)
+//    M15 : CRT range + BSL/SSL + Sweep     (كنس السيولة)
+//    M5  : MSS / CHoCH + CISD / TCISD      (تغيّر الهيكل ونمط التسليم)
+//    M1  : Entry + Retest                  (الدخول بعد إعادة الاختبار)
+//    SL  : خلف الـ sweep / الهيكل
+//    TP  : أقرب سيولة مقابلة
+//  فلتر Volume / CVD اختياري — إشارة BUY/SELL فقط عند توافق كل المراحل.
+//  ─────────────────────────────────────────────────────────────────────────────
+//  Non-repainting:
+//    • كل قيم الفريمات الأعلى تُلتقط لحظة إغلاق شمعة الفريم الأعلى فقط
+//      (lookahead_off + hold-on-rollover) فلا تتغيّر بأثر رجعي.
+//    • كل الإشارات تُحسم عند إغلاق الشمعة (barstate.isconfirmed) افتراضياً.
+//    • لا يوجد أي استخدام لبيانات مستقبلية.
+//    ملاحظة: نقاط الـ pivot تحتاج N شمعة للتأكيد — هذا تأخير مقصود لا إعادة رسم.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+indicator("SMC MTF Sniper (H4-H1-M15-M5-M1)", shorttitle="SMC MTF", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ───────────────────────────── 1 · TIMEFRAMES ─────────────────────────────────
+gTF = "1 · Timeframes"
+tfBias  = input.timeframe("240", "H4  · Bias / Structure",      group=gTF)
+tfPOI   = input.timeframe("60",  "H1  · SNR / MSNR / POI",      group=gTF)
+tfRange = input.timeframe("15",  "M15 · CRT Range / BSL-SSL",   group=gTF)
+tfShift = input.timeframe("5",   "M5  · MSS / CHoCH / CISD",    group=gTF)
+// فريم الدخول = فريم الشارت (يُنصح M1)
+
+// ───────────────────────────── 2 · STRUCTURE ──────────────────────────────────
+gST = "2 · Structure"
+pivBias  = input.int(5,  "H4 pivot length",            minval=2, group=gST)
+pivSNR   = input.int(5,  "H1 SNR pivot length",        minval=2, group=gST)
+pivMSNR  = input.int(15, "H1 MSNR (major) pivot len",  minval=3, group=gST)
+pivM5    = input.int(4,  "M5 pivot length",            minval=2, group=gST)
+allowFlat= input.bool(false, "Allow signals on neutral H4 bias", group=gST)
+
+// ───────────────────────────── 3 · H1 POI ─────────────────────────────────────
+var string gPOI = "3 · H1 POI (Order Blocks)"
+usePOI    = input.bool(true,  "Require sweep to happen at H1 POI", group=gPOI)
+poiAtrLen = input.int(14,     "POI displacement ATR length",       group=gPOI)
+poiAtrMlt = input.float(0.8,  "POI displacement ATR multiple", step=0.1, group=gPOI)
+poiTolAtr = input.float(1.5,  "POI proximity tolerance (ATR)", step=0.1, group=gPOI)
+
+// ───────────────────────── 4 · M15 CRT / LIQUIDITY ────────────────────────────
+gLQ = "4 · M15 CRT / Liquidity"
+crtMode   = input.string("Previous M15 candle", "CRT range source",
+             options=["Previous M15 candle", "M15 swing pivots"], group=gLQ)
+pivCRT    = input.int(3,  "M15 pivot length (swing mode)", minval=2, group=gLQ)
+sweepBars = input.int(60, "Sweep stays valid for N chart bars", minval=5, group=gLQ)
+
+// ───────────────────────── 5 · M5 SHIFT (MSS / CISD) ──────────────────────────
+gSH = "5 · M5 Shift"
+shiftMode = input.string("MSS or CISD", "Confirmation required",
+             options=["MSS or CISD", "MSS and CISD", "CISD only", "MSS only"], group=gSH)
+useTCISD  = input.bool(true,  "Require TCISD (engulf full delivery leg)", group=gSH)
+dispMlt   = input.float(0.6,  "Displacement ATR multiple", step=0.1, group=gSH)
+shiftBars = input.int(40, "Shift stays valid for N chart bars", minval=3, group=gSH)
+
+// ───────────────────────────── 6 · ENTRY (M1) ─────────────────────────────────
+gEN = "6 · Entry"
+needRetest  = input.bool(true, "Require retest of the broken level", group=gEN)
+retestTol   = input.float(0.4, "Retest tolerance (ATR)", step=0.1, group=gEN)
+cooldown    = input.int(10, "Cooldown bars after a signal", minval=0, group=gEN)
+confirmClose= input.bool(true, "Confirm on bar close (non-repaint)", group=gEN)
+
+// ───────────────────────────── 7 · RISK ───────────────────────────────────────
+gRK = "7 · Risk"
+atrLen    = input.int(14,   "ATR length (chart TF)", group=gRK)
+slMode    = input.string("Furthest of both", "SL anchor",
+             options=["Sweep extreme", "M5 structure", "Furthest of both"], group=gRK)
+slBuffer  = input.float(0.3,"SL buffer beyond anchor (ATR)", step=0.1, group=gRK)
+minRR     = input.float(1.5,"Minimum R:R for liquidity TP", step=0.1, group=gRK)
+rrFallback= input.float(2.0,"Fallback R:R if no liquidity found", step=0.1, group=gRK)
+usePDHL   = input.bool(true,"Include previous day H/L as liquidity", group=gRK)
+
+// ───────────────────────── 8 · VOLUME / CVD FILTER ────────────────────────────
+gVF = "8 · Volume / CVD (optional)"
+useVol   = input.bool(false, "Volume filter (vol > SMA × mult)", group=gVF)
+volLen   = input.int(20,     "Volume SMA length", group=gVF)
+volMlt   = input.float(1.2,  "Volume multiple", step=0.1, group=gVF)
+useCVD   = input.bool(false, "CVD filter (delta must agree)", group=gVF)
+cvdLen   = input.int(20,     "CVD rolling length", group=gVF)
+
+// ───────────────────────────── 9 · SESSIONS ───────────────────────────────────
+gSS = "9 · Sessions"
+useSess  = input.bool(false, "Session filter", group=gSS)
+sess1    = input.session("0800-1200", "London", group=gSS)
+sess2    = input.session("1300-1700", "New York", group=gSS)
+sessTZ   = input.string("GMT+0", "Timezone", group=gSS)
+
+// ───────────────────────────── 10 · VISUALS ───────────────────────────────────
+gVI = "10 · Visuals"
+showPOI   = input.bool(true, "Show H1 POI zones",        group=gVI)
+showCRT   = input.bool(true, "Show M15 BSL / SSL",       group=gVI)
+showSNR   = input.bool(true, "Show H1 SNR / MSNR",       group=gVI)
+showH4    = input.bool(true, "Show H4 swings",           group=gVI)
+showTrade = input.bool(true, "Show Entry / SL / TP",     group=gVI)
+showPanel = input.bool(true, "Show dashboard",           group=gVI)
+tradeBars = input.int(40, "Trade lines length (bars)", minval=5, group=gVI)
+
+// ═══════════════════════════ HELPERS ══════════════════════════════════════════
+
+// يمسك آخر قيمة مغلقة للفريم الأعلى (لا إعادة رسم)
+f_hold(float src, bool isNew) =>
+    var float v = na
+    if isNew
+        v := src[1]
+    v
+
+// هيكل السوق: آخر قمة/قاع مؤكد + الاتجاه عبر كسر الهيكل (BOS)
+f_structure(int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low,  len, len)
+    var float sh   = na
+    var float sl   = na
+    var int   bias = 0
+    if not na(ph)
+        sh := ph
+    if not na(pl)
+        sl := pl
+    if not na(sh) and close > sh
+        bias := 1
+    if not na(sl) and close < sl
+        bias := -1
+    [1.0 * bias, sh, sl]
+
+// دعم / مقاومة من نقاط الانعكاس
+f_levels(int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low,  len, len)
+    var float res = na
+    var float sup = na
+    if not na(ph)
+        res := ph
+    if not na(pl)
+        sup := pl
+    [res, sup]
+
+// SNR (قريب) + MSNR (رئيسي)
+f_snr(int lenMinor, int lenMajor) =>
+    [r1, s1] = f_levels(lenMinor)
+    [r2, s2] = f_levels(lenMajor)
+    [r1, s1, r2, s2]
+
+// POI = آخر Order Block قبل حركة اندفاعية
+f_poi(int aLen, float aMlt) =>
+    float a  = ta.atr(aLen)
+    bool  up = close > open and (close - open) > a * aMlt
+    bool  dn = open > close and (open - close) > a * aMlt
+    var float bullTop = na
+    var float bullBot = na
+    var float bearTop = na
+    var float bearBot = na
+    if up and close[1] < open[1]
+        bullTop := math.max(high[1], open[1])
+        bullBot := low[1]
+    if dn and close[1] > open[1]
+        bearTop := high[1]
+        bearBot := math.min(low[1], open[1])
+    [bullTop, bullBot, bearTop, bearBot]
+
+// نطاق CRT: شمعة الفريم السابقة + نقاط الانعكاس
+f_crt(int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low,  len, len)
+    var float sh = na
+    var float sl = na
+    if not na(ph)
+        sh := ph
+    if not na(pl)
+        sl := pl
+    [high, low, sh, sl]
+
+// CISD / TCISD
+//   bullCisd  = افتتاح أول شمعة في آخر سلسلة هابطة  (كسرها = تغيّر التسليم)
+//   bullTcisd = أعلى قمة في تلك السلسلة              (ابتلاعها = TCISD)
+f_cisd() =>
+    bool bear = close < open
+    bool bull = close > open
+    var float bearOpen = na
+    var float bearHigh = na
+    var float bullOpen = na
+    var float bullLow  = na
+    var float bullCisd  = na
+    var float bullTcisd = na
+    var float bearCisd  = na
+    var float bearTcisd = na
+    if bear
+        if not (close[1] < open[1])
+            bearOpen := open
+            bearHigh := high
+        else
+            bearHigh := math.max(nz(bearHigh, high), high)
+        bullCisd  := bearOpen
+        bullTcisd := bearHigh
+    if bull
+        if not (close[1] > open[1])
+            bullOpen := open
+            bullLow  := low
+        else
+            bullLow := math.min(nz(bullLow, low), low)
+        bearCisd  := bullOpen
+        bearTcisd := bullLow
+    [bullCisd, bullTcisd, bearCisd, bearTcisd]
+
+// أقرب مستوى فوق / تحت سعر معيّن
+f_nearestAbove(lv, floorLvl) =>
+    float best = na
+    for i = 0 to array.size(lv) - 1
+        float v = array.get(lv, i)
+        if not na(v) and v >= floorLvl
+            best := na(best) ? v : math.min(best, v)
+    best
+
+f_nearestBelow(lv, ceilLvl) =>
+    float best = na
+    for i = 0 to array.size(lv) - 1
+        float v = array.get(lv, i)
+        if not na(v) and v <= ceilLvl
+            best := na(best) ? v : math.max(best, v)
+    best
+
+// ═══════════════════════ HTF DATA (non-repainting) ════════════════════════════
+
+newBias  = ta.change(time(tfBias))  != 0
+newPOI   = ta.change(time(tfPOI))   != 0
+newRange = ta.change(time(tfRange)) != 0
+newShift = ta.change(time(tfShift)) != 0
+
+[h4BiasR, h4HighR, h4LowR] = request.security(syminfo.tickerid, tfBias, f_structure(pivBias), lookahead=barmerge.lookahead_off)
+h4Bias  = f_hold(h4BiasR, newBias)
+h4High  = f_hold(h4HighR, newBias)
+h4Low   = f_hold(h4LowR,  newBias)
+
+[snrRR, snrSR, msnrRR, msnrSR] = request.security(syminfo.tickerid, tfPOI, f_snr(pivSNR, pivMSNR), lookahead=barmerge.lookahead_off)
+snrRes   = f_hold(snrRR,   newPOI)
+snrSup   = f_hold(snrSR,   newPOI)
+msnrRes  = f_hold(msnrRR,  newPOI)
+msnrSup  = f_hold(msnrSR,  newPOI)
+
+[poiBullTR, poiBullBR, poiBearTR, poiBearBR] = request.security(syminfo.tickerid, tfPOI, f_poi(poiAtrLen, poiAtrMlt), lookahead=barmerge.lookahead_off)
+poiBullTop = f_hold(poiBullTR, newPOI)
+poiBullBot = f_hold(poiBullBR, newPOI)
+poiBearTop = f_hold(poiBearTR, newPOI)
+poiBearBot = f_hold(poiBearBR, newPOI)
+
+[crtHR, crtLR, crtPHR, crtPLR] = request.security(syminfo.tickerid, tfRange, f_crt(pivCRT), lookahead=barmerge.lookahead_off)
+crtCandleH = f_hold(crtHR,  newRange)
+crtCandleL = f_hold(crtLR,  newRange)
+crtPivotH  = f_hold(crtPHR, newRange)
+crtPivotL  = f_hold(crtPLR, newRange)
+
+bsl = crtMode == "Previous M15 candle" ? crtCandleH : crtPivotH   // Buy-Side Liquidity
+ssl = crtMode == "Previous M15 candle" ? crtCandleL : crtPivotL   // Sell-Side Liquidity
+
+[m5BiasR, m5HighR, m5LowR] = request.security(syminfo.tickerid, tfShift, f_structure(pivM5), lookahead=barmerge.lookahead_off)
+m5Bias = f_hold(m5BiasR, newShift)
+m5High = f_hold(m5HighR, newShift)
+m5Low  = f_hold(m5LowR,  newShift)
+
+[cBullR, cBullTR, cBearR, cBearTR] = request.security(syminfo.tickerid, tfShift, f_cisd(), lookahead=barmerge.lookahead_off)
+cisdBull  = f_hold(cBullR,  newShift)
+tcisdBull = f_hold(cBullTR, newShift)
+cisdBear  = f_hold(cBearR,  newShift)
+tcisdBear = f_hold(cBearTR, newShift)
+
+[pdhR, pdlR] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_off)
+pdh = usePDHL ? pdhR : na
+pdl = usePDHL ? pdlR : na
+
+// ═══════════════════════════ CHART-TF CONTEXT ═════════════════════════════════
+
+atrC   = ta.atr(atrLen)
+barOk  = not confirmClose or barstate.isconfirmed
+inSess1 = not na(time(timeframe.period, sess1, sessTZ))
+inSess2 = not na(time(timeframe.period, sess2, sessTZ))
+sessOk  = not useSess or inSess1 or inSess2
+
+volOk  = not useVol or na(volume) or volume > ta.sma(volume, volLen) * volMlt
+
+rng    = high - low
+sVol   = rng == 0 or na(volume) ? 0.0 : volume * ((close - low) - (high - close)) / rng
+cvd    = math.sum(sVol, cvdLen)
+cvdUpOk = not useCVD or cvd > 0
+cvdDnOk = not useCVD or cvd < 0
+
+biasLongOk  = h4Bias > 0 or (allowFlat and h4Bias == 0)
+biasShortOk = h4Bias < 0 or (allowFlat and h4Bias == 0)
+
+poiTol = atrC * poiTolAtr
+poiLongOk  = not usePOI or (not na(poiBullTop) and low  <= poiBullTop + poiTol and close >= poiBullBot - poiTol)
+poiShortOk = not usePOI or (not na(poiBearBot) and high >= poiBearBot - poiTol and close <= poiBearTop + poiTol)
+
+// ═══════════════════════════ STAGE MACHINE ════════════════════════════════════
+//  0 = idle · 1 = liquidity swept · 2 = structure shifted (waiting retest)
+
+var int   lStage = 0          // حالة الشراء
+var int   sStage = 0          // حالة البيع
+var float lSweep = na         // أدنى امتداد لكنس SSL (مرجع الستوب)
+var float sSweep = na         // أعلى امتداد لكنس BSL (مرجع الستوب)
+var float lSwLvl = na         // مستوى SSL الذي تم كنسه
+var float sSwLvl = na         // مستوى BSL الذي تم كنسه
+var int   lSwBar = 0
+var int   sSwBar = 0
+var float lBreak = na         // المستوى المكسور صعوداً (مرجع الـ retest)
+var float sBreak = na         // المستوى المكسور هبوطاً (مرجع الـ retest)
+var int   lShBar = 0
+var int   sShBar = 0
+var int   lastSig = -10000
+
+// ── مرحلة 1: كنس السيولة على M15 ─────────────────────────────────────────────
+sweepDn = not na(ssl) and low  < ssl and close > ssl and barOk   // كنس SSL → إشارة شراء محتملة
+sweepUp = not na(bsl) and high > bsl and close < bsl and barOk   // كنس BSL → إشارة بيع محتملة
+
+// ── مرحلة 2: تغيّر الهيكل / التسليم على M5 ───────────────────────────────────
+mssUp   = not na(m5High) and close > m5High
+mssDn   = not na(m5Low)  and close < m5Low
+cisdUp  = useTCISD ? (not na(tcisdBull) and close > tcisdBull) : (not na(cisdBull) and close > cisdBull)
+cisdDn  = useTCISD ? (not na(tcisdBear) and close < tcisdBear) : (not na(cisdBear) and close < cisdBear)
+dispUp  = (close - open) >  atrC * dispMlt
+dispDn  = (open - close) >  atrC * dispMlt
+
+shiftUp = shiftMode == "MSS and CISD" ? (mssUp and cisdUp) :
+          shiftMode == "CISD only"    ? cisdUp :
+          shiftMode == "MSS only"     ? mssUp  : (mssUp or cisdUp)
+shiftDn = shiftMode == "MSS and CISD" ? (mssDn and cisdDn) :
+          shiftMode == "CISD only"    ? cisdDn :
+          shiftMode == "MSS only"     ? mssDn  : (mssDn or cisdDn)
+
+shiftUp := shiftUp and dispUp
+shiftDn := shiftDn and dispDn
+
+// ── إدارة الحالة: LONG ───────────────────────────────────────────────────────
+if lStage == 1
+    // تتبّع أدنى امتداد للكنس، وإلغاء الإعداد إذا أغلق السعر تحت مستوى السيولة (كسر حقيقي لا كنس)
+    lSweep := na(lSweep) ? low : math.min(lSweep, low)
+    if close < lSwLvl or bar_index - lSwBar > sweepBars
+        lStage := 0
+        lSweep := na
+if lStage == 2
+    // بعد تغيّر الهيكل يُجمَّد امتداد الكنس ويصبح حدّ الإلغاء
+    if (not na(lSweep) and close < lSweep) or bar_index - lShBar > shiftBars
+        lStage := 0
+        lSweep := na
+        lBreak := na
+
+if lStage == 0 and sweepDn and poiLongOk and biasLongOk
+    lStage := 1
+    lSweep := low
+    lSwLvl := ssl
+    lSwBar := bar_index
+
+if lStage == 1 and shiftUp and barOk
+    lStage := 2
+    lBreak := not na(cisdBull) ? cisdBull : m5High
+    lShBar := bar_index
+
+// ── إدارة الحالة: SHORT ──────────────────────────────────────────────────────
+if sStage == 1
+    sSweep := na(sSweep) ? high : math.max(sSweep, high)
+    if close > sSwLvl or bar_index - sSwBar > sweepBars
+        sStage := 0
+        sSweep := na
+if sStage == 2
+    if (not na(sSweep) and close > sSweep) or bar_index - sShBar > shiftBars
+        sStage := 0
+        sSweep := na
+        sBreak := na
+
+if sStage == 0 and sweepUp and poiShortOk and biasShortOk
+    sStage := 1
+    sSweep := high
+    sSwLvl := bsl
+    sSwBar := bar_index
+
+if sStage == 1 and shiftDn and barOk
+    sStage := 2
+    sBreak := not na(cisdBear) ? cisdBear : m5Low
+    sShBar := bar_index
+
+// ── مرحلة 3: الدخول على M1 بعد إعادة الاختبار ────────────────────────────────
+tol      = atrC * retestTol
+coolOk   = bar_index - lastSig > cooldown
+
+// إعادة اختبار المستوى المكسور ثم شمعة تأكيد في اتجاه الصفقة
+retestUp = needRetest ?
+     (not na(lBreak) and low  <= lBreak + tol and close > open and close >= lBreak - tol) :
+     bar_index == lShBar
+retestDn = needRetest ?
+     (not na(sBreak) and high >= sBreak - tol and close < open and close <= sBreak + tol) :
+     bar_index == sShBar
+
+filtLong  = biasLongOk  and volOk and cvdUpOk and sessOk
+filtShort = biasShortOk and volOk and cvdDnOk and sessOk
+
+var float eEntry = na
+var float eSL    = na
+var float eTP    = na
+var float eRR    = na
+var int   eDir   = 0
+
+buySignal  = false
+sellSignal = false
+
+if lStage == 2 and retestUp and filtLong and coolOk and barOk
+    float swLow  = na(lSweep) ? low : lSweep
+    float stLow  = na(m5Low) ? swLow : m5Low
+    float anchor = slMode == "Sweep extreme" ? swLow :
+                   slMode == "M5 structure"  ? stLow : math.min(swLow, stLow)
+    float sl   = anchor - atrC * slBuffer
+    float risk = close - sl
+    if risk > 0
+        float floorLvl = close + risk * minRR
+        float tp = f_nearestAbove(array.from(bsl, snrRes, msnrRes, h4High, pdh), floorLvl)
+        eEntry := close
+        eSL    := sl
+        eTP    := na(tp) ? close + risk * rrFallback : tp
+        eRR    := (eTP - eEntry) / risk
+        eDir   := 1
+        buySignal := true
+        lastSig := bar_index
+        lStage  := 0
+        lSweep  := na
+        lBreak  := na
+
+if sStage == 2 and retestDn and filtShort and coolOk and barOk
+    float swHigh = na(sSweep) ? high : sSweep
+    float stHigh = na(m5High) ? swHigh : m5High
+    float anchor = slMode == "Sweep extreme" ? swHigh :
+                   slMode == "M5 structure"  ? stHigh : math.max(swHigh, stHigh)
+    float sl   = anchor + atrC * slBuffer
+    float risk = sl - close
+    if risk > 0
+        float ceilLvl = close - risk * minRR
+        float tp = f_nearestBelow(array.from(ssl, snrSup, msnrSup, h4Low, pdl), ceilLvl)
+        eEntry := close
+        eSL    := sl
+        eTP    := na(tp) ? close - risk * rrFallback : tp
+        eRR    := (eEntry - eTP) / risk
+        eDir   := -1
+        sellSignal := true
+        lastSig := bar_index
+        sStage  := 0
+        sSweep  := na
+        sBreak  := na
+
+// ═══════════════════════════════ VISUALS ══════════════════════════════════════
+
+plot(showCRT and not na(bsl) ? bsl : na, "BSL (M15)", color.new(color.red,   20), 1, plot.style_linebr)
+plot(showCRT and not na(ssl) ? ssl : na, "SSL (M15)", color.new(color.green, 20), 1, plot.style_linebr)
+plot(showSNR and not na(snrRes)  ? snrRes  : na, "H1 Resistance", color.new(color.maroon, 45), 1, plot.style_linebr)
+plot(showSNR and not na(snrSup)  ? snrSup  : na, "H1 Support",    color.new(color.teal,   45), 1, plot.style_linebr)
+plot(showSNR and not na(msnrRes) ? msnrRes : na, "H1 MSNR Res",   color.new(color.maroon, 10), 2, plot.style_linebr)
+plot(showSNR and not na(msnrSup) ? msnrSup : na, "H1 MSNR Sup",   color.new(color.teal,   10), 2, plot.style_linebr)
+plot(showH4  and not na(h4High)  ? h4High  : na, "H4 Swing High", color.new(color.orange, 30), 1, plot.style_linebr)
+plot(showH4  and not na(h4Low)   ? h4Low   : na, "H4 Swing Low",  color.new(color.blue,   30), 1, plot.style_linebr)
+
+// مناطق POI
+var box bullPoi = na
+var box bearPoi = na
+if showPOI and not na(poiBullTop) and not na(poiBullBot)
+    if na(bullPoi)
+        bullPoi := box.new(bar_index, poiBullTop, bar_index + 1, poiBullBot,
+             border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 88))
+    if ta.change(poiBullTop) != 0
+        box.set_left(bullPoi, bar_index)
+    box.set_top(bullPoi, poiBullTop)
+    box.set_bottom(bullPoi, poiBullBot)
+    box.set_right(bullPoi, bar_index + 1)
+if showPOI and not na(poiBearTop) and not na(poiBearBot)
+    if na(bearPoi)
+        bearPoi := box.new(bar_index, poiBearTop, bar_index + 1, poiBearBot,
+             border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 88))
+    if ta.change(poiBearTop) != 0
+        box.set_left(bearPoi, bar_index)
+    box.set_top(bearPoi, poiBearTop)
+    box.set_bottom(bearPoi, poiBearBot)
+    box.set_right(bearPoi, bar_index + 1)
+
+// علامات الكنس
+plotshape(sweepDn and lStage >= 1 and bar_index == lSwBar, "SSL Sweep", shape.triangleup,
+     location.belowbar, color.new(color.aqua, 0), size=size.tiny)
+plotshape(sweepUp and sStage >= 1 and bar_index == sSwBar, "BSL Sweep", shape.triangledown,
+     location.abovebar, color.new(color.fuchsia, 0), size=size.tiny)
+
+// إشارات الدخول
+plotshape(buySignal,  "BUY",  shape.labelup,   location.belowbar,
+     color.new(color.green, 0), text="BUY",  textcolor=color.white, size=size.normal)
+plotshape(sellSignal, "SELL", shape.labeldown, location.abovebar,
+     color.new(color.red, 0),   text="SELL", textcolor=color.white, size=size.normal)
+
+// خطوط الصفقة
+if showTrade and (buySignal or sellSignal)
+    col = buySignal ? color.green : color.red
+    line.new(bar_index, eEntry, bar_index + tradeBars, eEntry, color=color.new(col, 0), width=2)
+    line.new(bar_index, eSL,    bar_index + tradeBars, eSL,    color=color.new(color.red, 20),   width=1, style=line.style_dashed)
+    line.new(bar_index, eTP,    bar_index + tradeBars, eTP,    color=color.new(color.green, 20), width=1, style=line.style_dashed)
+    label.new(bar_index + tradeBars, eTP, "TP " + str.tostring(eTP, format.mintick) +
+         "  (" + str.tostring(eRR, "#.##") + "R)", style=label.style_label_left,
+         color=color.new(color.green, 80), textcolor=color.white, size=size.small)
+    label.new(bar_index + tradeBars, eSL, "SL " + str.tostring(eSL, format.mintick),
+         style=label.style_label_left, color=color.new(color.red, 80),
+         textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════ DASHBOARD ════════════════════════════════════
+
+f_stageTxt(int st) => st == 0 ? "—" : st == 1 ? "SWEPT" : "SHIFTED"
+f_stageCol(int st) => st == 0 ? color.gray : st == 1 ? color.orange : color.aqua
+
+var table dash = table.new(position.top_right, 3, 8,
+     bgcolor=color.new(color.black, 78), border_color=color.new(color.gray, 50), border_width=1)
+
+if showPanel and barstate.islast
+    tfTooHigh = timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(tfShift)
+    table.cell(dash, 0, 0, "STAGE",  text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 0, "LONG",   text_color=color.silver, text_size=size.small)
+    table.cell(dash, 2, 0, "SHORT",  text_color=color.silver, text_size=size.small)
+
+    biasTxt = h4Bias > 0 ? "BULL" : h4Bias < 0 ? "BEAR" : "FLAT"
+    table.cell(dash, 0, 1, "H4 Bias", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, biasTxt, text_color=h4Bias > 0 ? color.green : color.gray, text_size=size.small)
+    table.cell(dash, 2, 1, biasTxt, text_color=h4Bias < 0 ? color.red   : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 2, "H1 POI", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, poiLongOk  ? "OK" : "wait", text_color=poiLongOk  ? color.green : color.gray, text_size=size.small)
+    table.cell(dash, 2, 2, poiShortOk ? "OK" : "wait", text_color=poiShortOk ? color.red   : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 3, "M15 Sweep", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, lStage >= 1 ? "SSL ✓" : "—", text_color=lStage >= 1 ? color.green : color.gray, text_size=size.small)
+    table.cell(dash, 2, 3, sStage >= 1 ? "BSL ✓" : "—", text_color=sStage >= 1 ? color.red   : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 4, "M5 MSS/CISD", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, f_stageTxt(lStage), text_color=f_stageCol(lStage), text_size=size.small)
+    table.cell(dash, 2, 4, f_stageTxt(sStage), text_color=f_stageCol(sStage), text_size=size.small)
+
+    table.cell(dash, 0, 5, "M1 Retest", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, lStage == 2 ? str.tostring(lBreak, format.mintick) : "—",
+         text_color=lStage == 2 ? color.aqua : color.gray, text_size=size.small)
+    table.cell(dash, 2, 5, sStage == 2 ? str.tostring(sBreak, format.mintick) : "—",
+         text_color=sStage == 2 ? color.aqua : color.gray, text_size=size.small)
+
+    filtTxt = (useVol ? (volOk ? "V✓ " : "V✗ ") : "") + (useCVD ? (cvd > 0 ? "CVD+" : "CVD-") : "") +
+              (useSess ? (sessOk ? " S✓" : " S✗") : "")
+    table.cell(dash, 0, 6, "Filters", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, filtTxt == "" ? "off" : filtTxt, text_color=color.silver, text_size=size.small)
+    table.cell(dash, 2, 6, eDir == 0 ? "—" : (eDir > 0 ? "last BUY" : "last SELL"),
+         text_color=eDir > 0 ? color.green : eDir < 0 ? color.red : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 7, "Chart TF", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, timeframe.period, text_color=color.silver, text_size=size.small)
+    table.cell(dash, 2, 7, tfTooHigh ? "TOO HIGH" : "OK",
+         text_color=tfTooHigh ? color.red : color.green, text_size=size.small)
+
+// ═══════════════════════════════ ALERTS ═══════════════════════════════════════
+
+alertcondition(buySignal,  "SMC BUY",  "SMC MTF: BUY — H4 bias + H1 POI + M15 sweep + M5 shift + M1 retest aligned")
+alertcondition(sellSignal, "SMC SELL", "SMC MTF: SELL — H4 bias + H1 POI + M15 sweep + M5 shift + M1 retest aligned")
+alertcondition(buySignal or sellSignal, "SMC ANY", "SMC MTF: new setup confirmed")
+
+if buySignal or sellSignal
+    alert((buySignal ? "BUY " : "SELL ") + syminfo.ticker + " (" + timeframe.period + ")" +
+         "\nEntry: " + str.tostring(eEntry, format.mintick) +
+         "\nSL: "    + str.tostring(eSL,    format.mintick) +
+         "\nTP: "    + str.tostring(eTP,    format.mintick) +
+         "\nR:R: "   + str.tostring(eRR, "#.##"), alert.freq_once_per_bar_close)

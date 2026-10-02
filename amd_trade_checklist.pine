@@ -1,0 +1,72 @@
+//@version=5
+indicator(
+     title             = "AMD Trade Checklist (XAUUSD)",
+     shorttitle        = "AMD Checklist",
+     overlay           = true,
+     max_lines_count   = 500,
+     max_labels_count  = 500
+ )
+
+// Checklist :
+//   1. Ouverture de marché        ✔ (ce fichier)
+//   2. Accumulation               — à venir
+//   3. Manipulation               — à venir
+//   4. Niveau HTF                 — à venir
+//   5. Supply / Demand            — à venir
+//   6. Stop Loss                  — à venir
+//   7. TP                         — à venir
+//   8. Un trade (par session)     — à venir
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 1. OUVERTURE DE MARCHÉ
+// Marque l'ouverture de Londres et de New York : ligne verticale à l'heure
+// d'ouverture, prix d'ouverture tracé jusqu'à la fin de la fenêtre, fond coloré.
+// La fenêtre (ouverture → fin) sert de zone de travail aux étapes suivantes.
+// ═══════════════════════════════════════════════════════════════════════════════
+grp1   = "1. Ouverture de marché"
+tz     = input.string("America/New_York", "Fuseau horaire des sessions",
+     options = ["America/New_York", "Europe/London", "Europe/Paris", "UTC"], group = grp1)
+
+showLdn = input.bool(true,          "Londres",  inline = "ldn", group = grp1)
+ldnSess = input.session("0300-0700", "",        inline = "ldn", group = grp1)
+ldnCol  = input.color(color.blue,    "",        inline = "ldn", group = grp1)
+
+showNy  = input.bool(true,          "New York", inline = "ny",  group = grp1)
+nySess  = input.session("0930-1200", "",        inline = "ny",  group = grp1)
+nyCol   = input.color(color.orange,  "",        inline = "ny",  group = grp1)
+
+showBg  = input.bool(true, "Colorer la fenêtre de session", group = grp1)
+
+// Suit une ouverture : renvoie [dans la fenêtre, barre d'ouverture, prix d'ouverture]
+f_marketOpen(bool show, string sess, color col, string name) =>
+    inSess = show and timeframe.isintraday and not na(time(timeframe.period, sess, tz))
+    isOpen = inSess and not inSess[1]
+
+    var float openPx = na
+    var line  openLn = na
+
+    if isOpen
+        openPx := open
+        line.new(bar_index, low, bar_index, high + syminfo.mintick, extend = extend.both,
+             color = color.new(col, 50), style = line.style_dotted)
+        openLn := line.new(bar_index, openPx, bar_index + 1, openPx, color = col, width = 2)
+        label.new(bar_index, openPx, name + " Open  " + str.tostring(openPx, format.mintick),
+             style = label.style_label_right, color = color.new(col, 20),
+             textcolor = color.white, size = size.small)
+    else if inSess and not na(openLn)
+        line.set_x2(openLn, bar_index)
+
+    [inSess, isOpen, openPx]
+
+[inLdn, isLdnOpen, ldnOpenPx] = f_marketOpen(showLdn, ldnSess, ldnCol, "London")
+[inNy,  isNyOpen,  nyOpenPx]  = f_marketOpen(showNy,  nySess,  nyCol,  "New York")
+
+// Session active (utilisée par les étapes suivantes)
+inOpenWindow  = inLdn or inNy
+activeOpenPx  = inNy ? nyOpenPx : inLdn ? ldnOpenPx : na
+
+bgcolor(showBg and inLdn ? color.new(ldnCol, 92) : na, title = "Fenêtre Londres")
+bgcolor(showBg and inNy  ? color.new(nyCol,  92) : na, title = "Fenêtre New York")
+
+alertcondition(isLdnOpen, "Ouverture Londres",  "XAUUSD : ouverture de Londres")
+alertcondition(isNyOpen,  "Ouverture New York", "XAUUSD : ouverture de New York")

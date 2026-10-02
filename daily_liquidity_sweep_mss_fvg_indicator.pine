@@ -8,36 +8,36 @@ indicator(
      max_boxes_count  = 500
  )
 
-// مؤشر نموذج: سحب سيولة قمة/قاع اليوم السابق ← كسر الهيكل (MSS) ← الدخول من الفجوة (FVG)
-//   1. Liq – السعر يتجاوز قمة (أو قاع) اليوم السابق.
-//   2. MSS – إغلاق شمعة تحت آخر قاع (أو فوق آخر قمة) صنع موجة السحب.
-//   3. FVG – فجوة سعرية من حركة الاندفاع؛ الدخول عند رجوع السعر إليها.
-//   الوقف خلف أقصى نقطة للسحب، والهدف بنسبة ربح/مخاطرة أو المستوى اليومي المقابل.
+// Model: previous-day High/Low liquidity sweep → market structure shift (MSS) → fair value gap (FVG) entry
+//   1. Liq – price trades through the previous daily High (or Low).
+//   2. MSS – a candle closes through the last swing low (high) that created the sweep leg.
+//   3. FVG – the displacement leaves a fair value gap; entry on the retrace into it.
+//   Stop beyond the sweep extreme; target at a fixed R:R or the opposite daily level.
 
 // ─── INPUTS ───────────────────────────────────────────────────────────────────
-htf          = input.timeframe("D", "الإطار الزمني للسيولة",            group="السيولة")
-enableShort  = input.bool(true,  "إشارات البيع (سحب القمة)",           group="السيولة")
-enableLong   = input.bool(true,  "إشارات الشراء (سحب القاع)",          group="السيولة")
+htf          = input.timeframe("D", "Liquidity Timeframe",            group="Liquidity")
+enableShort  = input.bool(true,  "Short signals (High sweep)",           group="Liquidity")
+enableLong   = input.bool(true,  "Long signals (Low sweep)",          group="Liquidity")
 
-pivotLen     = input.int(2,  "طول القمة/القاع (MSS)", minval=1,          group="الهيكل")
-maxBarsMss   = input.int(36, "أقصى شموع: السحب ← MSS", minval=1,       group="الهيكل")
+pivotLen     = input.int(2,  "Swing Pivot Length (MSS)", minval=1,          group="Structure")
+maxBarsMss   = input.int(36, "Max bars Sweep → MSS", minval=1,       group="Structure")
 
-fvgMinAtr    = input.float(0.1, "أقل حجم للفجوة (x ATR)", step=0.05, minval=0, group="الدخول من FVG")
-entryMode    = input.string("FVG Edge", "سعر الدخول", options=["FVG Edge", "FVG Mid"], group="الدخول من FVG")
-maxBarsFvg   = input.int(12, "أقصى شموع: MSS ← FVG", minval=1,         group="الدخول من FVG")
-maxBarsFill  = input.int(24, "أقصى شموع لتنفيذ الدخول", minval=1,      group="الدخول من FVG")
+fvgMinAtr    = input.float(0.1, "Min FVG size (x ATR)", step=0.05, minval=0, group="FVG Entry")
+entryMode    = input.string("FVG Edge", "Entry Price", options=["FVG Edge", "FVG Mid"], group="FVG Entry")
+maxBarsFvg   = input.int(12, "Max bars MSS → FVG", minval=1,         group="FVG Entry")
+maxBarsFill  = input.int(24, "Max bars to fill entry", minval=1,      group="FVG Entry")
 
-atrLen       = input.int(14, "طول ATR",                                  group="إدارة المخاطر")
-slBufAtr     = input.float(0.1, "هامش الوقف (x ATR)", step=0.05, minval=0, group="إدارة المخاطر")
-tpMode       = input.string("Risk:Reward", "الهدف", options=["Risk:Reward", "Opposite Daily Level"], group="إدارة المخاطر")
-rr           = input.float(2.0, "نسبة الربح/المخاطرة", step=0.1, minval=0.1, group="إدارة المخاطر")
+atrLen       = input.int(14, "ATR Length",                                  group="Risk Management")
+slBufAtr     = input.float(0.1, "SL buffer beyond sweep (x ATR)", step=0.05, minval=0, group="Risk Management")
+tpMode       = input.string("Risk:Reward", "Take Profit", options=["Risk:Reward", "Opposite Daily Level"], group="Risk Management")
+rr           = input.float(2.0, "Risk:Reward", step=0.1, minval=0.1, group="Risk Management")
 
-useSession   = input.bool(false, "السحب داخل الجلسة فقط",                group="الجلسة")
-sessWindow   = input.session("0700-1700", "الجلسة",                      group="الجلسة")
-sessTz       = input.string("GMT+0", "المنطقة الزمنية",                  group="الجلسة")
+useSession   = input.bool(false, "Only take sweeps inside session",                group="Session")
+sessWindow   = input.session("0700-1700", "Session",                      group="Session")
+sessTz       = input.string("GMT+0", "Session Timezone",                  group="Session")
 
-showLevels   = input.bool(true, "إظهار قمة/قاع اليوم السابق",           group="العرض")
-showTable    = input.bool(true, "إظهار الجدول",                          group="العرض")
+showLevels   = input.bool(true, "Show previous High/Low",           group="Visuals")
+showTable    = input.bool(true, "Show status table",                          group="Visuals")
 
 // ─── HIGHER-TIMEFRAME LIQUIDITY (non-repainting previous High/Low) ────────────
 [pdh, pdl] = request.security(syminfo.tickerid, htf, [high[1], low[1]], lookahead=barmerge.lookahead_on)
@@ -183,7 +183,7 @@ if enableShort and not na(pdh)
             sState   := 4
             sFillEvt := true
             inTrade  := true
-            label.new(bar_index, high, "بيع", style=label.style_label_down,
+            label.new(bar_index, high, "SELL", style=label.style_label_down,
                       color=color.red, textcolor=color.white, size=size.small)
         else if bar_index - sArmBar > maxBarsFill
             sState := 0
@@ -270,7 +270,7 @@ if enableLong and not na(pdl)
             lState   := 4
             lFillEvt := true
             inTrade  := true
-            label.new(bar_index, low, "شراء", style=label.style_label_up,
+            label.new(bar_index, low, "BUY", style=label.style_label_up,
                       color=color.green, textcolor=color.white, size=size.small)
         else if bar_index - lArmBar > maxBarsFill
             lState := 0
@@ -303,28 +303,28 @@ plot(showLevels ? pdl : na, "Previous Low",  color=color.new(color.gray, 0), sty
 bgcolor(newPeriod ? color.new(color.gray, 85) : na, title="New Period")
 
 // ─── ALERTS ───────────────────────────────────────────────────────────────────
-alertcondition(sSweepEvt, "Short: High swept",    "Liq: سحب سيولة قمة اليوم السابق على {{ticker}}")
-alertcondition(sMssEvt,   "Short: MSS",           "MSS هابط بعد سحب القمة على {{ticker}}")
-alertcondition(sArmEvt,   "Short: FVG entry set", "فجوة FVG هابطة – أمر بيع معلّق على {{ticker}}")
-alertcondition(sFillEvt,  "Short: Entry filled",  "دخول بيع من FVG على {{ticker}} @ {{close}}")
-alertcondition(lSweepEvt, "Long: Low swept",      "Liq: سحب سيولة قاع اليوم السابق على {{ticker}}")
-alertcondition(lMssEvt,   "Long: MSS",            "MSS صاعد بعد سحب القاع على {{ticker}}")
-alertcondition(lArmEvt,   "Long: FVG entry set",  "فجوة FVG صاعدة – أمر شراء معلّق على {{ticker}}")
-alertcondition(lFillEvt,  "Long: Entry filled",   "دخول شراء من FVG على {{ticker}} @ {{close}}")
-alertcondition(sTpEvt or lTpEvt, "Take profit hit", "تم الوصول للهدف TP على {{ticker}}")
-alertcondition(sSlEvt or lSlEvt, "Stop loss hit",   "تم ضرب وقف الخسارة SL على {{ticker}}")
+alertcondition(sSweepEvt, "Short: High swept",    "Liq: previous High swept on {{ticker}}")
+alertcondition(sMssEvt,   "Short: MSS",           "Bearish MSS after High sweep on {{ticker}}")
+alertcondition(sArmEvt,   "Short: FVG entry set", "Bearish FVG – sell limit set on {{ticker}}")
+alertcondition(sFillEvt,  "Short: Entry filled",  "Short entry filled from FVG on {{ticker}} @ {{close}}")
+alertcondition(lSweepEvt, "Long: Low swept",      "Liq: previous Low swept on {{ticker}}")
+alertcondition(lMssEvt,   "Long: MSS",            "Bullish MSS after Low sweep on {{ticker}}")
+alertcondition(lArmEvt,   "Long: FVG entry set",  "Bullish FVG – buy limit set on {{ticker}}")
+alertcondition(lFillEvt,  "Long: Entry filled",   "Long entry filled from FVG on {{ticker}} @ {{close}}")
+alertcondition(sTpEvt or lTpEvt, "Take profit hit", "Take profit hit on {{ticker}}")
+alertcondition(sSlEvt or lSlEvt, "Stop loss hit",   "Stop loss hit on {{ticker}}")
 
 // Single "any alert()" alert with full details (create one alert → "Any alert() function call")
 if sArmEvt
-    alert("بيع معلّق " + syminfo.ticker + " | دخول " + str.tostring(sEntry, format.mintick) +
+    alert("SELL LIMIT " + syminfo.ticker + " | Entry " + str.tostring(sEntry, format.mintick) +
           " | SL " + str.tostring(sSL, format.mintick) + " | TP " + str.tostring(sTP, format.mintick), alert.freq_once_per_bar_close)
 if lArmEvt
-    alert("شراء معلّق " + syminfo.ticker + " | دخول " + str.tostring(lEntry, format.mintick) +
+    alert("BUY LIMIT " + syminfo.ticker + " | Entry " + str.tostring(lEntry, format.mintick) +
           " | SL " + str.tostring(lSL, format.mintick) + " | TP " + str.tostring(lTP, format.mintick), alert.freq_once_per_bar_close)
 
 // ─── INFO TABLE ───────────────────────────────────────────────────────────────
 stateText(s) =>
-    s == 0 ? "انتظار سحب السيولة" : s == 1 ? "تم السحب – انتظار MSS" : s == 2 ? "MSS – انتظار FVG" : s == 3 ? "أمر معلّق" : s == 4 ? "صفقة مفتوحة" : "انتهى اليوم"
+    s == 0 ? "Waiting sweep" : s == 1 ? "Swept – wait MSS" : s == 2 ? "MSS – wait FVG" : s == 3 ? "Entry armed" : s == 4 ? "In trade" : "Done today"
 
 var table info = table.new(position.top_right, 2, 3,
      bgcolor      = color.new(color.black, 80),
@@ -332,12 +332,12 @@ var table info = table.new(position.top_right, 2, 3,
      border_width = 1)
 
 if showTable and barstate.islast
-    table.cell(info, 0, 0, "الجهة",            text_color=color.silver, text_size=size.small)
-    table.cell(info, 1, 0, "الحالة",           text_color=color.silver, text_size=size.small)
-    table.cell(info, 0, 1, "بيع (سحب القمة)",  text_color=color.white,  text_size=size.small)
+    table.cell(info, 0, 0, "Side",             text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 0, "State",            text_color=color.silver, text_size=size.small)
+    table.cell(info, 0, 1, "High sweep (S)",   text_color=color.white,  text_size=size.small)
     table.cell(info, 1, 1, stateText(sState),  text_color=color.red,    text_size=size.small)
-    table.cell(info, 0, 2, "شراء (سحب القاع)", text_color=color.white,  text_size=size.small)
+    table.cell(info, 0, 2, "Low sweep (L)",    text_color=color.white,  text_size=size.small)
     table.cell(info, 1, 2, stateText(lState),  text_color=color.green,  text_size=size.small)
 
 if timeframe.in_seconds() >= timeframe.in_seconds(htf)
-    runtime.error("استخدم إطاراً زمنياً أصغر من إطار السيولة (مثلاً شارت 5 دقائق مع مستويات اليوم D).")
+    runtime.error("Use a chart timeframe lower than the Liquidity Timeframe (e.g. 5m chart with D levels).")

@@ -1,0 +1,280 @@
+//@version=5
+strategy(
+     title             = "Daily Liquidity Sweep + MSS + FVG (5m)",
+     shorttitle        = "Liq-MSS-FVG",
+     overlay           = true,
+     default_qty_type  = strategy.percent_of_equity,
+     default_qty_value = 5,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.07,
+     slippage          = 3,
+     max_lines_count   = 500,
+     max_labels_count  = 500,
+     max_boxes_count   = 500
+ )
+
+// Model (see chart):
+//   1. Liq  – price trades through the previous daily High (or Low), taking the liquidity resting there.
+//   2. MSS  – on the lower timeframe (5m) price closes through the last swing low (high) that
+//             created the sweep leg → market structure shift against the sweep.
+//   3. FVG  – the displacement leaves a fair value gap; a limit order is placed at the FVG and
+//             filled on the retrace. Stop goes beyond the sweep extreme.
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+htf          = input.timeframe("D", "Liquidity Timeframe",              group="Liquidity")
+enableShort  = input.bool(true,  "Trade sweeps of the High (short)",    group="Liquidity")
+enableLong   = input.bool(true,  "Trade sweeps of the Low (long)",      group="Liquidity")
+
+pivotLen     = input.int(2, "Swing Pivot Length (MSS)", minval=1,       group="Structure")
+maxBarsMss   = input.int(36, "Max bars Sweep → MSS",   minval=1,        group="Structure")
+
+fvgMinAtr    = input.float(0.1, "Min FVG size (x ATR)", step=0.05, minval=0, group="FVG Entry")
+entryMode    = input.string("FVG Edge", "Entry Price", options=["FVG Edge", "FVG Mid"], group="FVG Entry")
+maxBarsFvg   = input.int(12, "Max bars MSS → FVG",       minval=1,      group="FVG Entry")
+maxBarsFill  = input.int(24, "Max bars to fill entry",   minval=1,      group="FVG Entry")
+
+atrLen       = input.int(14, "ATR Length",                              group="Risk Management")
+slBufAtr     = input.float(0.1, "SL buffer beyond sweep (x ATR)", step=0.05, minval=0, group="Risk Management")
+tpMode       = input.string("Risk:Reward", "Take Profit", options=["Risk:Reward", "Opposite Daily Level"], group="Risk Management")
+rr           = input.float(2.0, "Risk:Reward", step=0.1, minval=0.1,    group="Risk Management")
+
+useSession   = input.bool(false, "Only take sweeps inside session",     group="Session")
+sessWindow   = input.session("0700-1700", "Session",                    group="Session")
+sessTz       = input.string("GMT+0", "Session Timezone",                group="Session")
+
+showLevels   = input.bool(true, "Show previous High/Low",               group="Visuals")
+
+// ─── HIGHER-TIMEFRAME LIQUIDITY (non-repainting previous High/Low) ────────────
+[pdh, pdl] = request.security(syminfo.tickerid, htf, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+newPeriod  = ta.change(time(htf)) != 0
+
+inSess = not useSession or not na(time(timeframe.period, sessWindow, sessTz))
+atr    = ta.atr(atrLen)
+minFvg = atr * fvgMinAtr
+
+// ─── SWING POINTS (for MSS) ───────────────────────────────────────────────────
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+var float lastSwingHigh    = na
+var int   lastSwingHighBar = na
+var float lastSwingLow     = na
+var int   lastSwingLowBar  = na
+if not na(ph)
+    lastSwingHigh    := ph
+    lastSwingHighBar := bar_index - pivotLen
+if not na(pl)
+    lastSwingLow     := pl
+    lastSwingLowBar  := bar_index - pivotLen
+
+// ─── FVG DETECTION ────────────────────────────────────────────────────────────
+// Bearish FVG: candle 1 low above candle 3 high. Bullish FVG: candle 1 high below candle 3 low.
+bearFvg = low[2] > high and (low[2] - high) >= minFvg
+bullFvg = high[2] < low and (low - high[2]) >= minFvg
+
+// States: 0 = idle, 1 = swept (waiting MSS), 2 = MSS (waiting FVG), 3 = order armed, 4 = done for the day
+// ─── SHORT SIDE STATE ─────────────────────────────────────────────────────────
+var int   sState    = 0
+var float sExtreme  = na
+var int   sSweepBar = na
+var float sMss      = na
+var int   sMssPivot = na
+var int   sMssBar   = na
+var float sFvgTop   = na
+var float sFvgBot   = na
+var int   sFvgBar   = na
+var float sEntry    = na
+var float sSL       = na
+var float sTP       = na
+var int   sArmBar   = na
+var label sLiqLbl   = na
+
+// ─── LONG SIDE STATE ──────────────────────────────────────────────────────────
+var int   lState    = 0
+var float lExtreme  = na
+var int   lSweepBar = na
+var float lMss      = na
+var int   lMssPivot = na
+var int   lMssBar   = na
+var float lFvgTop   = na
+var float lFvgBot   = na
+var int   lFvgBar   = na
+var float lEntry    = na
+var float lSL       = na
+var float lTP       = na
+var int   lArmBar   = na
+var label lLiqLbl   = na
+
+// ─── NEW PERIOD RESET ─────────────────────────────────────────────────────────
+if newPeriod
+    if sState == 3
+        strategy.cancel("Short")
+    if lState == 3
+        strategy.cancel("Long")
+    sState := 0
+    lState := 0
+
+// ═══ SHORT: sweep of previous High ═══════════════════════════════════════════
+if enableShort and not na(pdh)
+    if sState == 0 and high > pdh and inSess and not na(lastSwingLow) and lastSwingLow < pdh
+        sState    := 1
+        sExtreme  := high
+        sSweepBar := bar_index
+        sMss      := lastSwingLow
+        sMssPivot := lastSwingLowBar
+        sFvgTop   := na
+        sFvgBot   := na
+        sLiqLbl   := label.new(bar_index, high, "Liq", style=label.style_label_down,
+                          color=color.new(color.blue, 70), textcolor=color.white, size=size.small)
+    else if sState == 1
+        if high > sExtreme
+            // Sweep leg extends: MSS level follows the most recent higher swing low
+            sExtreme := high
+            label.set_xy(sLiqLbl, bar_index, high)
+            if not na(lastSwingLow) and lastSwingLowBar > sMssPivot and lastSwingLow < close
+                sMss      := lastSwingLow
+                sMssPivot := lastSwingLowBar
+        if close < sMss
+            sState  := 2
+            sMssBar := bar_index
+            line.new(sMssPivot, sMss, bar_index, sMss, color=color.gray, style=line.style_dotted, width=2)
+            label.new(math.round((sMssPivot + bar_index) / 2), sMss, "MSS", style=label.style_label_up,
+                      color=color.new(color.gray, 100), textcolor=color.gray, size=size.small)
+        else if bar_index - sSweepBar > maxBarsMss
+            sState := 0
+
+    // Track latest bearish FVG formed after the sweep (and still unmitigated)
+    if (sState == 1 or sState == 2) and bearFvg and bar_index - 2 >= sSweepBar
+        sFvgTop := low[2]
+        sFvgBot := high
+        sFvgBar := bar_index - 2
+    if not na(sFvgTop) and close > sFvgTop
+        sFvgTop := na
+        sFvgBot := na
+
+    if sState == 2
+        if not na(sFvgTop) and strategy.position_size == 0
+            sEntry := entryMode == "FVG Edge" ? sFvgBot : (sFvgTop + sFvgBot) / 2
+            sSL    := sExtreme + atr * slBufAtr
+            risk    = sSL - sEntry
+            sTP    := tpMode == "Risk:Reward" ? sEntry - risk * rr : pdl
+            if risk > 0 and sTP < sEntry
+                strategy.entry("Short", strategy.short, limit=sEntry, comment="Short FVG")
+                strategy.exit("Short X", "Short", stop=sSL, limit=sTP)
+                box.new(sFvgBar, sFvgTop, bar_index + 10, sFvgBot, border_color=color.new(color.red, 40),
+                        bgcolor=color.new(color.red, 85), text="FVG", text_color=color.gray, text_size=size.small)
+                sState  := 3
+                sArmBar := bar_index
+            else
+                sState := 4
+        else if bar_index - sMssBar > maxBarsFvg
+            sState := 0
+
+    if sState == 3
+        if strategy.position_size < 0
+            sState := 4
+        else if bar_index - sArmBar > maxBarsFill or high > sSL
+            strategy.cancel("Short")
+            sState := 0
+
+// ═══ LONG: sweep of previous Low ═════════════════════════════════════════════
+if enableLong and not na(pdl)
+    if lState == 0 and low < pdl and inSess and not na(lastSwingHigh) and lastSwingHigh > pdl
+        lState    := 1
+        lExtreme  := low
+        lSweepBar := bar_index
+        lMss      := lastSwingHigh
+        lMssPivot := lastSwingHighBar
+        lFvgTop   := na
+        lFvgBot   := na
+        lLiqLbl   := label.new(bar_index, low, "Liq", style=label.style_label_up,
+                          color=color.new(color.blue, 70), textcolor=color.white, size=size.small)
+    else if lState == 1
+        if low < lExtreme
+            lExtreme := low
+            label.set_xy(lLiqLbl, bar_index, low)
+            if not na(lastSwingHigh) and lastSwingHighBar > lMssPivot and lastSwingHigh > close
+                lMss      := lastSwingHigh
+                lMssPivot := lastSwingHighBar
+        if close > lMss
+            lState  := 2
+            lMssBar := bar_index
+            line.new(lMssPivot, lMss, bar_index, lMss, color=color.gray, style=line.style_dotted, width=2)
+            label.new(math.round((lMssPivot + bar_index) / 2), lMss, "MSS", style=label.style_label_down,
+                      color=color.new(color.gray, 100), textcolor=color.gray, size=size.small)
+        else if bar_index - lSweepBar > maxBarsMss
+            lState := 0
+
+    if (lState == 1 or lState == 2) and bullFvg and bar_index - 2 >= lSweepBar
+        lFvgTop := low
+        lFvgBot := high[2]
+        lFvgBar := bar_index - 2
+    if not na(lFvgBot) and close < lFvgBot
+        lFvgTop := na
+        lFvgBot := na
+
+    if lState == 2
+        if not na(lFvgTop) and strategy.position_size == 0
+            lEntry := entryMode == "FVG Edge" ? lFvgTop : (lFvgTop + lFvgBot) / 2
+            lSL    := lExtreme - atr * slBufAtr
+            risk    = lEntry - lSL
+            lTP    := tpMode == "Risk:Reward" ? lEntry + risk * rr : pdh
+            if risk > 0 and lTP > lEntry
+                strategy.entry("Long", strategy.long, limit=lEntry, comment="Long FVG")
+                strategy.exit("Long X", "Long", stop=lSL, limit=lTP)
+                box.new(lFvgBar, lFvgTop, bar_index + 10, lFvgBot, border_color=color.new(color.green, 40),
+                        bgcolor=color.new(color.green, 85), text="FVG", text_color=color.gray, text_size=size.small)
+                lState  := 3
+                lArmBar := bar_index
+            else
+                lState := 4
+        else if bar_index - lMssBar > maxBarsFvg
+            lState := 0
+
+    if lState == 3
+        if strategy.position_size > 0
+            lState := 4
+        else if bar_index - lArmBar > maxBarsFill or low < lSL
+            strategy.cancel("Long")
+            lState := 0
+
+// One position at a time: once a side fills, drop the other side's pending order
+if strategy.position_size < 0 and lState == 3
+    strategy.cancel("Long")
+    lState := 0
+if strategy.position_size > 0 and sState == 3
+    strategy.cancel("Short")
+    sState := 0
+
+// ─── PLOTS ────────────────────────────────────────────────────────────────────
+plot(showLevels ? pdh : na, "Previous High", color=color.new(color.gray, 0), style=plot.style_linebr, linewidth=1)
+plot(showLevels ? pdl : na, "Previous Low",  color=color.new(color.gray, 0), style=plot.style_linebr, linewidth=1)
+
+plot(sState == 3 ? sEntry : na, "Short Entry", color=color.new(color.red, 0),   style=plot.style_linebr)
+plot(sState == 3 ? sSL    : na, "Short SL",    color=color.new(color.orange, 0), style=plot.style_linebr)
+plot(sState == 3 ? sTP    : na, "Short TP",    color=color.new(color.teal, 0),  style=plot.style_linebr)
+plot(lState == 3 ? lEntry : na, "Long Entry",  color=color.new(color.green, 0), style=plot.style_linebr)
+plot(lState == 3 ? lSL    : na, "Long SL",     color=color.new(color.orange, 0), style=plot.style_linebr)
+plot(lState == 3 ? lTP    : na, "Long TP",     color=color.new(color.teal, 0),  style=plot.style_linebr)
+
+bgcolor(newPeriod ? color.new(color.gray, 85) : na, title="New Period")
+
+// ─── INFO TABLE ───────────────────────────────────────────────────────────────
+stateText(s) =>
+    s == 0 ? "Waiting sweep" : s == 1 ? "Swept – wait MSS" : s == 2 ? "MSS – wait FVG" : s == 3 ? "Order armed" : "Done today"
+
+var table info = table.new(position.top_right, 2, 3,
+     bgcolor      = color.new(color.black, 80),
+     border_color = color.new(color.white, 60),
+     border_width = 1)
+
+if barstate.islast
+    table.cell(info, 0, 0, "Side",            text_color=color.silver, text_size=size.small)
+    table.cell(info, 1, 0, "State",           text_color=color.silver, text_size=size.small)
+    table.cell(info, 0, 1, "High sweep (S)",  text_color=color.white,  text_size=size.small)
+    table.cell(info, 1, 1, stateText(sState), text_color=color.red,    text_size=size.small)
+    table.cell(info, 0, 2, "Low sweep (L)",   text_color=color.white,  text_size=size.small)
+    table.cell(info, 1, 2, stateText(lState), text_color=color.green,  text_size=size.small)
+
+if timeframe.in_seconds() >= timeframe.in_seconds(htf)
+    runtime.error("Use a chart timeframe lower than the Liquidity Timeframe (e.g. 5m chart with D levels).")

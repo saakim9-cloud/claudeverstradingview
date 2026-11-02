@@ -1,0 +1,433 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SMC SEQUENCE MODEL — le modele en 6 etapes, suivi comme une machine a etats
+// ═══════════════════════════════════════════════════════════════════════════════
+//  0. Contexte      : killzone + FVG HTF non mitige + discount/premium
+//  1. Liquidity sweep : meche qui prend un pivot, cloture qui revient dans le range
+//  2-4. Displacement + MSS + FVG : un seul evenement, pas trois etapes
+//       (gros corps, cloture au-dela du swing oppose, vide laisse derriere)
+//  5. Entry         : retour dans le FVG (CE, bord proche ou extremite)
+//  6. Target        : liquidite opposee, avec un RR minimum verifie AVANT l'entree
+//
+//  L'indicateur refuse un setup dont le RR planifie est sous le seuil, expire un
+//  setup qui traine, et compte le resultat de chaque sequence complete.
+//
+//  Note : les pivots se confirment "pivLen" bougies apres leur formation. Les
+//  etapes 1 et 2-4 sont donc datees a la bougie de confirmation, pas en avance.
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("SMC Sequence Model (6 etapes)", shorttitle="SMC Seq", overlay=true,
+     max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ─── ETAPE 0 · CONTEXTE ───────────────────────────────────────────────────────
+g0        = "0 · Contexte (filtres d'entree en sequence)"
+useKZ     = input.bool(true,  "Exiger une killzone",                     group=g0)
+londonS   = input.session("0700-1000", "Killzone Londres (UTC)",         group=g0)
+nyS       = input.session("1230-1500", "Killzone New York (UTC)",        group=g0)
+useHtf    = input.bool(true,  "Exiger un FVG HTF non mitige",            group=g0)
+htfTF     = input.timeframe("240", "Timeframe du FVG directionnel",      group=g0)
+useEq     = input.bool(true,  "Exiger discount (long) / premium (short)", group=g0)
+eqLen     = input.int(60,     "Longueur du range pour l'equilibrium",    minval=10, group=g0)
+
+// ─── ETAPE 1 · LIQUIDITY SWEEP ────────────────────────────────────────────────
+g1        = "1 · Liquidity sweep"
+pivLen    = input.int(5,      "Longueur des pivots",      minval=2, group=g1)
+wickRatio = input.float(1.5,  "Meche / corps minimum",    minval=0.1, step=0.1, group=g1)
+
+// ─── ETAPES 2-4 · DISPLACEMENT + MSS + FVG ────────────────────────────────────
+g2          = "2-4 · Displacement + MSS + FVG"
+atrLen      = input.int(20,    "Longueur ATR",                    minval=1, group=g2)
+dispAtrMult = input.float(1.5, "Corps minimum (x ATR)",           minval=0.1, step=0.1, group=g2)
+dispBodyPct = input.float(0.60,"Corps / range minimum",           minval=0.1, maxval=1.0, step=0.05, group=g2)
+maxBarsDisp = input.int(5,     "Delai max sweep -> displacement", minval=1, maxval=50, group=g2)
+needMSS     = input.bool(true, "Exiger la cassure de structure en cloture", group=g2)
+
+// ─── ETAPE 5 · ENTRY ──────────────────────────────────────────────────────────
+g3           = "5 · Entry"
+entryMode    = input.string("CE (50 %)", "Point d'entree dans le FVG",
+                 options=["CE (50 %)", "Bord proche (fill rapide)", "Extremite (meilleur prix)"], group=g3)
+maxBarsEntry = input.int(20,   "Delai max FVG -> entree (bougies)", minval=1, maxval=200, group=g3)
+slBuffer     = input.float(3.0,"Marge sous la meche (prix)",        minval=0, step=0.1, group=g3)
+
+// ─── ETAPE 6 · TARGET ─────────────────────────────────────────────────────────
+g4         = "6 · Target"
+tpMode     = input.string("Liquidite opposee", "Objectif",
+               options=["Liquidite opposee", "Ratio fixe"], group=g4)
+tpLookback = input.int(40,   "Recherche de la liquidite opposee (bougies)", minval=5, group=g4)
+fixedRR    = input.float(3.0,"Ratio fixe",      minval=0.5, step=0.5, group=g4)
+minRR      = input.float(2.0,"RR minimum exige", minval=0.5, step=0.5, group=g4)
+
+// ─── AFFICHAGE ────────────────────────────────────────────────────────────────
+g5        = "Affichage"
+showPanel = input.bool(true, "Tableau de suivi",        group=g5)
+showStats = input.bool(true, "Statistiques du modele",  group=g5)
+showZones = input.bool(true, "Zones FVG HTF",           group=g5)
+showTrade = input.bool(true, "Boites entree / SL / TP", group=g5)
+cBull     = input.color(#089981, "Haussier", group=g5)
+cBear     = input.color(#f23645, "Baissier", group=g5)
+cWait     = input.color(#ff9800, "En attente", group=g5)
+cIdle     = input.color(#787b86, "Inactif",   group=g5)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MESURES
+// ═══════════════════════════════════════════════════════════════════════════════
+atr    = ta.atr(atrLen)
+bodyN  = math.abs(close - open)
+upWick = high - math.max(open, close)
+dnWick = math.min(open, close) - low
+
+inLondon = not na(time(timeframe.period, londonS, "GMT+0"))
+inNY     = not na(time(timeframe.period, nyS,     "GMT+0"))
+inKZ     = inLondon or inNY
+
+rangeHi = ta.highest(high, eqLen)
+rangeLo = ta.lowest(low,  eqLen)
+eqMid   = (rangeHi + rangeLo) / 2
+inDiscount = close < eqMid
+inPremium  = close > eqMid
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FVG HTF : on ne garde que le dernier non mitige de chaque sens
+// ═══════════════════════════════════════════════════════════════════════════════
+[hH1, hL1, hH3, hL3, hTime] = request.security(syminfo.tickerid, htfTF,
+     [high[1], low[1], high[3], low[3], time], lookahead=barmerge.lookahead_off)
+newHtfBar = hTime != hTime[1]
+
+var float hbTop = na
+var float hbBot = na
+var bool  hbOn  = false
+var float hsTop = na
+var float hsBot = na
+var bool  hsOn  = false
+var box   hbBox = na
+var box   hsBox = na
+
+htfSecs  = timeframe.in_seconds(htfTF)
+curSecs  = timeframe.in_seconds(timeframe.period)
+barsPerH = int(math.max(1, math.round(htfSecs / math.max(curSecs, 1))))
+
+if newHtfBar and not na(hL1) and not na(hH3) and hL1 > hH3
+    hbTop := hL1
+    hbBot := hH3
+    hbOn  := true
+    if showZones
+        if not na(hbBox)
+            box.delete(hbBox)
+        hbBox := box.new(bar_index - barsPerH * 3, hbTop, bar_index + 5, hbBot,
+                  bgcolor=color.new(cBull, 88), border_color=color.new(cBull, 40),
+                  border_width=1, text="FVG " + htfTF, text_size=size.tiny,
+                  text_color=color.new(cBull, 10), text_halign=text.align_left)
+
+if newHtfBar and not na(hH1) and not na(hL3) and hH1 < hL3
+    hsTop := hL3
+    hsBot := hH1
+    hsOn  := true
+    if showZones
+        if not na(hsBox)
+            box.delete(hsBox)
+        hsBox := box.new(bar_index - barsPerH * 3, hsTop, bar_index + 5, hsBot,
+                  bgcolor=color.new(cBear, 88), border_color=color.new(cBear, 40),
+                  border_width=1, text="FVG " + htfTF, text_size=size.tiny,
+                  text_color=color.new(cBear, 10), text_halign=text.align_left)
+
+if hbOn and low <= hbBot
+    hbOn := false
+    if not na(hbBox)
+        box.delete(hbBox)
+        hbBox := na
+if hsOn and high >= hsTop
+    hsOn := false
+    if not na(hsBox)
+        box.delete(hsBox)
+        hsBox := na
+
+if hbOn and not na(hbBox)
+    box.set_right(hbBox, bar_index + 5)
+if hsOn and not na(hsBox)
+    box.set_right(hsBox, bar_index + 5)
+
+inHtfBull = hbOn and low  <= hbTop and high >= hbBot
+inHtfBear = hsOn and high >= hsBot and low  <= hsTop
+
+// Contexte complet, par direction
+ctxLong  = (not useKZ or inKZ) and (not useHtf or inHtfBull) and (not useEq or inDiscount)
+ctxShort = (not useKZ or inKZ) and (not useHtf or inHtfBear) and (not useEq or inPremium)
+ctxAny   = ctxLong or ctxShort
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PIVOTS = LES POOLS DE LIQUIDITE
+// ═══════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low,  pivLen, pivLen)
+
+var float lastPH = na
+var float lastPL = na
+var bool  phUsed = false
+var bool  plUsed = false
+
+if not na(ph)
+    lastPH := ph
+    phUsed := false
+if not na(pl)
+    lastPL := pl
+    plUsed := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BRIQUES DE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+// Etape 1 — sweep
+tookLow   = not na(lastPL) and not plUsed and low  < lastPL and close > lastPL
+tookHigh  = not na(lastPH) and not phUsed and high > lastPH and close < lastPH
+sweepDn   = tookLow  and dnWick >= wickRatio * bodyN
+sweepUp   = tookHigh and upWick >= wickRatio * bodyN
+
+// Etapes 2-4 — displacement + MSS + FVG (meme evenement)
+bodyM   = math.abs(close[1] - open[1])
+rngM    = high[1] - low[1]
+isDispM = rngM > 0 and bodyM >= dispAtrMult * atr[1] and (bodyM / rngM) >= dispBodyPct
+gapUp   = low  > high[2]
+gapDn   = high < low[2]
+dispUp  = gapUp and isDispM and close[1] > open[1]
+dispDn  = gapDn and isDispM and close[1] < open[1]
+mssUp   = not needMSS or (not na(lastPH) and (close > lastPH or close[1] > lastPH))
+mssDn   = not needMSS or (not na(lastPL) and (close < lastPL or close[1] < lastPL))
+legUp   = dispUp and mssUp
+legDn   = dispDn and mssDn
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MACHINE A ETATS
+//  0 = repos · 1 = sweep valide · 2 = FVG arme · 3 = en position
+// ═══════════════════════════════════════════════════════════════════════════════
+var int   state    = 0
+var int   dir      = 0
+var float sweepLvl = na
+var float sweepExt = na
+var int   sweepBar = na
+var float fTop     = na
+var float fBot     = na
+var int   fBar     = na
+var float ePx      = na
+var float sPx      = na
+var float tPx      = na
+var float rrPlan   = na
+var int   eBar     = na
+var box   fvgBox   = na
+var box   tpBox    = na
+var box   slBox    = na
+var string lastOut = "—"
+
+var int   nWin  = 0
+var int   nLoss = 0
+var int   nSkip = 0
+var float sumR  = 0.0
+
+// ─── ETAPE 1 : armement du sweep ──────────────────────────────────────────────
+if state == 0
+    if sweepDn and ctxLong
+        state    := 1
+        dir      := 1
+        sweepLvl := lastPL
+        sweepExt := low
+        sweepBar := bar_index
+        plUsed   := true
+    else if sweepUp and ctxShort
+        state    := 1
+        dir      := -1
+        sweepLvl := lastPH
+        sweepExt := high
+        sweepBar := bar_index
+        phUsed   := true
+
+// ─── ETAPES 2-4 : displacement + MSS + FVG, sinon expiration ──────────────────
+else if state == 1
+    expired = bar_index - sweepBar > maxBarsDisp
+    broken  = dir > 0 ? close < sweepExt : close > sweepExt
+    if expired or broken
+        state := 0
+        dir   := 0
+        nSkip := nSkip + 1
+    else if dir > 0 and legUp
+        fTop := low
+        fBot := high[2]
+        fBar := bar_index
+        prox = fTop
+        dist = fBot
+        ce   = (fTop + fBot) / 2
+        ePx := entryMode == "CE (50 %)" ? ce : entryMode == "Bord proche (fill rapide)" ? prox : dist
+        sPx := sweepExt - slBuffer
+        liq = ta.highest(high, tpLookback)
+        tPx := tpMode == "Liquidite opposee" ? liq : ePx + (ePx - sPx) * fixedRR
+        rrPlan := (ePx - sPx) > 0 ? (tPx - ePx) / (ePx - sPx) : na
+        if na(rrPlan) or rrPlan < minRR
+            state   := 0
+            dir     := 0
+            nSkip   := nSkip + 1
+            lastOut := "RR refuse"
+        else
+            state := 2
+            if showTrade
+                fvgBox := box.new(fBar - 2, fTop, fBar + maxBarsEntry, fBot,
+                           bgcolor=color.new(cBull, 85), border_color=color.new(cBull, 35),
+                           border_width=1, text="FVG", text_size=size.tiny,
+                           text_color=color.new(cBull, 10))
+    else if dir < 0 and legDn
+        fTop := low[2]
+        fBot := high
+        fBar := bar_index
+        prox = fBot
+        dist = fTop
+        ce   = (fTop + fBot) / 2
+        ePx := entryMode == "CE (50 %)" ? ce : entryMode == "Bord proche (fill rapide)" ? prox : dist
+        sPx := sweepExt + slBuffer
+        liq = ta.lowest(low, tpLookback)
+        tPx := tpMode == "Liquidite opposee" ? liq : ePx - (sPx - ePx) * fixedRR
+        rrPlan := (sPx - ePx) > 0 ? (ePx - tPx) / (sPx - ePx) : na
+        if na(rrPlan) or rrPlan < minRR
+            state   := 0
+            dir     := 0
+            nSkip   := nSkip + 1
+            lastOut := "RR refuse"
+        else
+            state := 2
+            if showTrade
+                fvgBox := box.new(fBar - 2, fTop, fBar + maxBarsEntry, fBot,
+                           bgcolor=color.new(cBear, 85), border_color=color.new(cBear, 35),
+                           border_width=1, text="FVG", text_size=size.tiny,
+                           text_color=color.new(cBear, 10))
+
+// ─── ETAPE 5 : attente du retour dans le FVG ──────────────────────────────────
+else if state == 2
+    expired = bar_index - fBar > maxBarsEntry
+    broken  = dir > 0 ? close < sPx : close > sPx
+    filled  = dir > 0 ? low <= ePx : high >= ePx
+    if filled
+        state := 3
+        eBar  := bar_index
+        label.new(bar_index, dir > 0 ? low : high,
+             (dir > 0 ? "LONG " : "SHORT ") + str.tostring(rrPlan, "#.##") + "R",
+             style=dir > 0 ? label.style_label_up : label.style_label_down,
+             color=dir > 0 ? cBull : cBear, textcolor=color.white, size=size.small)
+        if showTrade
+            tpBox := box.new(bar_index, tPx, bar_index + 1, ePx,
+                      bgcolor=color.new(cBull, 88), border_color=color.new(cBull, 55), border_width=1)
+            slBox := box.new(bar_index, ePx, bar_index + 1, sPx,
+                      bgcolor=color.new(cBear, 88), border_color=color.new(cBear, 55), border_width=1)
+    else if expired or broken
+        state   := 0
+        dir     := 0
+        nSkip   := nSkip + 1
+        lastOut := expired ? "FVG expire" : "Invalide avant entree"
+        if not na(fvgBox)
+            box.delete(fvgBox)
+            fvgBox := na
+
+// ─── ETAPE 6 : resolution ─────────────────────────────────────────────────────
+else if state == 3
+    hitTp = dir > 0 ? high >= tPx : low  <= tPx
+    hitSl = dir > 0 ? low  <= sPx : high >= sPx
+    if showTrade and not na(tpBox) and not na(slBox)
+        box.set_right(tpBox, bar_index + 1)
+        box.set_right(slBox, bar_index + 1)
+    if hitSl and hitTp
+        // les deux touches sur la meme bougie : on compte le pire des cas
+        nLoss   := nLoss + 1
+        sumR    := sumR - 1.0
+        lastOut := "SL (bougie mixte)"
+        state   := 0
+        dir     := 0
+    else if hitTp
+        nWin    := nWin + 1
+        sumR    := sumR + rrPlan
+        lastOut := "TP +" + str.tostring(rrPlan, "#.##") + "R"
+        state   := 0
+        dir     := 0
+    else if hitSl
+        nLoss   := nLoss + 1
+        sumR    := sumR - 1.0
+        lastOut := "SL -1R"
+        state   := 0
+        dir     := 0
+
+// Lignes de travail pendant qu'un setup est arme ou en cours
+plot(state >= 2 ? ePx : na, "Entree", color=color.new(#2962ff, 0), style=plot.style_linebr, linewidth=1)
+plot(state >= 2 ? sPx : na, "Stop",   color=color.new(cBear, 0),   style=plot.style_linebr, linewidth=1)
+plot(state >= 2 ? tPx : na, "Target", color=color.new(cBull, 0),   style=plot.style_linebr, linewidth=1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TABLEAU DE SUIVI DES 6 ETAPES
+// ═══════════════════════════════════════════════════════════════════════════════
+stepCol(done, active) =>
+    done ? color.new(cBull, 70) : active ? color.new(cWait, 60) : color.new(cIdle, 85)
+
+stepTxt(done, active) =>
+    done ? "valide" : active ? "en cours" : "—"
+
+var table pnl = table.new(position.top_right, 2, 13, border_width=1,
+     frame_color=color.new(color.gray, 55), frame_width=1)
+
+if showPanel and barstate.islast
+    dirTxt = dir > 0 ? "LONG" : dir < 0 ? "SHORT" : "—"
+    dirCol = dir > 0 ? cBull : dir < 0 ? cBear : cIdle
+
+    table.cell(pnl, 0, 0, "SMC SEQUENCE", bgcolor=color.new(#2962ff, 15),
+         text_color=color.white, text_size=size.small)
+    table.cell(pnl, 1, 0, dirTxt, bgcolor=color.new(#2962ff, 15),
+         text_color=dirCol, text_size=size.small)
+
+    s0done = ctxAny
+    table.cell(pnl, 0, 1, "0 · Contexte", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 1, s0done ? "ok" : "hors zone", text_size=size.tiny,
+         text_color=color.white, bgcolor=stepCol(s0done, false))
+
+    table.cell(pnl, 0, 2, "1 · Liquidity sweep", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 2, stepTxt(state >= 1, state == 0 and ctxAny), text_size=size.tiny,
+         text_color=color.white, bgcolor=stepCol(state >= 1, state == 0 and ctxAny))
+
+    table.cell(pnl, 0, 3, "2-4 · Displ. + MSS + FVG", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 3, stepTxt(state >= 2, state == 1), text_size=size.tiny,
+         text_color=color.white, bgcolor=stepCol(state >= 2, state == 1))
+
+    table.cell(pnl, 0, 4, "5 · Entry", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 4, stepTxt(state >= 3, state == 2), text_size=size.tiny,
+         text_color=color.white, bgcolor=stepCol(state >= 3, state == 2))
+
+    table.cell(pnl, 0, 5, "6 · Target", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 5, state == 3 ? "en cours" : "—", text_size=size.tiny,
+         text_color=color.white, bgcolor=stepCol(false, state == 3))
+
+    table.cell(pnl, 0, 6, "Entree", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 6, state >= 2 ? str.tostring(ePx, format.mintick) : "—",
+         text_size=size.tiny, text_color=color.white)
+    table.cell(pnl, 0, 7, "Stop", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 7, state >= 2 ? str.tostring(sPx, format.mintick) : "—",
+         text_size=size.tiny, text_color=cBear)
+    table.cell(pnl, 0, 8, "Target", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 8, state >= 2 ? str.tostring(tPx, format.mintick) : "—",
+         text_size=size.tiny, text_color=cBull)
+    table.cell(pnl, 0, 9, "RR planifie", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 9, state >= 2 ? str.tostring(rrPlan, "#.##") + "R" : "—",
+         text_size=size.tiny, text_color=color.white)
+
+    table.cell(pnl, 0, 10, "Dernier resultat", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 10, lastOut, text_size=size.tiny, text_color=color.white)
+
+    nTot    = nWin + nLoss
+    wr      = nTot > 0 ? 100.0 * nWin / nTot : 0.0
+    statTxt = str.tostring(nTot) + " · " + str.tostring(wr, "#.#") + "% · " + str.tostring(sumR, "#.#") + "R"
+    table.cell(pnl, 0, 11, "Trades / WR / R", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 11, showStats ? statTxt : "—", text_size=size.tiny,
+         text_color=sumR >= 0 ? cBull : cBear)
+    table.cell(pnl, 0, 12, "Setups ecartes", text_size=size.tiny, text_color=color.gray)
+    table.cell(pnl, 1, 12, showStats ? str.tostring(nSkip) : "—", text_size=size.tiny,
+         text_color=color.gray)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALERTES
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(state == 1 and state[1] == 0, "Etape 1 · Sweep",
+     "SMC Seq : liquidite prise, en attente du displacement")
+alertcondition(state == 2 and state[1] == 1, "Etapes 2-4 · Displacement + MSS + FVG",
+     "SMC Seq : FVG arme, ordre limite a placer")
+alertcondition(state == 3 and state[1] == 2, "Etape 5 · Entree declenchee",
+     "SMC Seq : le prix est revenu dans le FVG, position ouverte")
+alertcondition(state == 0 and state[1] == 3, "Etape 6 · Trade cloture",
+     "SMC Seq : TP ou SL touche")

@@ -1,0 +1,486 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SMC Candle Scanner (XAUUSD)
+//  Marque automatiquement les bougies qui comptent reellement :
+//    1. Bougie de deplacement (gros corps + FVG laisse derriere)
+//    2. Prise de liquidite / sweep (meche qui prend un pivot sans cloture au-dela)
+//    3. Order block (derniere bougie opposee avant le deplacement)
+//    4. FVG du timeframe courant + FVG du timeframe superieur (4H par defaut)
+//    5. BOS / CHoCH (cassure de structure EN CLOTURE)
+//    6. Killzones Asie / Londres / New York / Silver Bullet
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("SMC Candle Scanner (XAUUSD)", shorttitle="SMC Scanner", overlay=true,
+     max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ─── 1 · FVG HIGHER TIMEFRAME ─────────────────────────────────────────────────
+gHTF        = "1 · FVG Higher Timeframe"
+htfTF       = input.timeframe("240", "Timeframe du FVG directionnel",          group=gHTF)
+showHtfFvg  = input.bool(true,       "Afficher les FVG HTF",                   group=gHTF)
+htfMinSize  = input.float(0.0,       "Taille minimum du FVG HTF (prix)",       minval=0, step=0.1, group=gHTF)
+htfMaxBoxes = input.int(8,           "Nombre de FVG HTF conserves",            minval=1, maxval=50, group=gHTF)
+
+// ─── 2 · FVG TIMEFRAME COURANT ────────────────────────────────────────────────
+gFVG        = "2 · FVG timeframe courant"
+showLtfFvg  = input.bool(true,       "Afficher les FVG du TF courant",         group=gFVG)
+onlyDispFvg = input.bool(true,       "Uniquement les FVG issus d'un deplacement", group=gFVG)
+ltfMaxBoxes = input.int(12,          "Nombre de FVG conserves",                minval=1, maxval=50, group=gFVG)
+showCE      = input.bool(true,       "Tracer le CE (50% du FVG) = entree",     group=gFVG)
+
+// ─── 3 · BOUGIE DE DEPLACEMENT ────────────────────────────────────────────────
+gDisp        = "3 · Bougie de deplacement"
+atrLen       = input.int(20,    "Longueur ATR",                        minval=1,  group=gDisp)
+dispAtrMult  = input.float(1.5, "Corps minimum (x ATR)",               minval=0.1, step=0.1, group=gDisp)
+dispBodyPct  = input.float(0.60,"Corps / range minimum",               minval=0.1, maxval=1.0, step=0.05, group=gDisp)
+showDisp     = input.bool(true, "Marquer les bougies de deplacement",  group=gDisp)
+
+// ─── 4 · PRISE DE LIQUIDITE ───────────────────────────────────────────────────
+gSweep     = "4 · Prise de liquidite (sweep)"
+pivLen     = input.int(5,       "Longueur des pivots",        minval=1, group=gSweep)
+wickRatio  = input.float(1.5,   "Meche / corps minimum",      minval=0.1, step=0.1, group=gSweep)
+showSweep  = input.bool(true,   "Marquer les sweeps",         group=gSweep)
+showPivots = input.bool(true,   "Tracer les niveaux de liquidite", group=gSweep)
+
+// ─── 5 · ORDER BLOCKS ─────────────────────────────────────────────────────────
+gOB        = "5 · Order blocks"
+showOB     = input.bool(true, "Afficher les order blocks",            group=gOB)
+obLookback = input.int(6,     "Recherche de l'OB (bougies en arriere)", minval=1, maxval=20, group=gOB)
+obMaxBoxes = input.int(6,     "Nombre d'OB conserves",                minval=1, maxval=30, group=gOB)
+
+// ─── 6 · STRUCTURE ────────────────────────────────────────────────────────────
+gBOS    = "6 · Structure"
+showBos = input.bool(true, "Afficher BOS / CHoCH (en cloture)", group=gBOS)
+
+// ─── 7 · KILLZONES (UTC) ──────────────────────────────────────────────────────
+gSess      = "7 · Killzones (heures UTC)"
+showKZ     = input.bool(true,            "Colorer les killzones",   group=gSess)
+asiaSess   = input.session("0000-0600",  "Range Asie",              group=gSess)
+londonSess = input.session("0700-1000",  "Killzone Londres",        group=gSess)
+nySess     = input.session("1230-1500",  "Killzone New York",       group=gSess)
+sbSess     = input.session("1400-1500",  "Silver Bullet",           group=gSess)
+kzOnly     = input.bool(false,           "Signaux uniquement en killzone", group=gSess)
+showAsiaBx = input.bool(true,            "Tracer le range Asie (liquidite)", group=gSess)
+
+// ─── 8 · AFFICHAGE ────────────────────────────────────────────────────────────
+gUI        = "8 · Affichage"
+showPanel  = input.bool(true, "Tableau de bord", group=gUI)
+cBull      = input.color(color.new(#089981, 82), "FVG haussier",      group=gUI)
+cBear      = input.color(color.new(#f23645, 82), "FVG baissier",      group=gUI)
+cHtfBull   = input.color(color.new(#089981, 68), "FVG HTF haussier",  group=gUI)
+cHtfBear   = input.color(color.new(#f23645, 68), "FVG HTF baissier",  group=gUI)
+cOB        = input.color(color.new(#ff9800, 78), "Order block",       group=gUI)
+cSweep     = input.color(#ab47bc,                "Sweep",             group=gUI)
+cDisp      = input.color(#2962ff,                "Deplacement",       group=gUI)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MESURES DE BASE
+// ═══════════════════════════════════════════════════════════════════════════════
+atr    = ta.atr(atrLen)
+bodyN  = math.abs(close - open)
+rngN   = high - low
+upWick = high - math.max(open, close)
+dnWick = math.min(open, close) - low
+
+// Sessions
+tAsia   = time(timeframe.period, asiaSess,   "GMT+0")
+tLondon = time(timeframe.period, londonSess, "GMT+0")
+tNY     = time(timeframe.period, nySess,     "GMT+0")
+tSB     = time(timeframe.period, sbSess,     "GMT+0")
+inAsia   = not na(tAsia)
+inLondon = not na(tLondon)
+inNY     = not na(tNY)
+inSB     = not na(tSB)
+inKZ     = inLondon or inNY
+sigOK    = not kzOnly or inKZ
+
+bgcolor(showKZ and inAsia   ? color.new(color.gray,   92) : na, title="Range Asie")
+bgcolor(showKZ and inLondon ? color.new(#2962ff,      92) : na, title="Killzone Londres")
+bgcolor(showKZ and inNY     ? color.new(#ff9800,      92) : na, title="Killzone New York")
+bgcolor(showKZ and inSB     ? color.new(#ab47bc,      88) : na, title="Silver Bullet")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OUTILS BOITES
+// ═══════════════════════════════════════════════════════════════════════════════
+pushBox(arr, b, maxN) =>
+    array.push(arr, b)
+    if array.size(arr) > maxN
+        box.delete(array.shift(arr))
+
+pushLine(arr, l, maxN) =>
+    array.push(arr, l)
+    if array.size(arr) > maxN
+        line.delete(array.shift(arr))
+
+var array<box>  bullFvg   = array.new<box>()
+var array<box>  bearFvg   = array.new<box>()
+var array<line> bullCE    = array.new<line>()
+var array<line> bearCE    = array.new<line>()
+var array<box>  htfBull   = array.new<box>()
+var array<box>  htfBear   = array.new<box>()
+var array<box>  obBoxes   = array.new<box>()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  1. BOUGIE DE DEPLACEMENT + FVG DU TF COURANT
+//     Le trio est confirme sur la bougie courante ; la bougie de deplacement
+//     est celle du milieu, donc [1]. On la marque avec offset=-1.
+// ═══════════════════════════════════════════════════════════════════════════════
+bodyM   = math.abs(close[1] - open[1])
+rngM    = high[1] - low[1]
+isDispM = rngM > 0 and bodyM >= dispAtrMult * atr[1] and (bodyM / rngM) >= dispBodyPct
+
+gapUp = low  > high[2]          // FVG haussier : vide entre high[2] et low[0]
+gapDn = high < low[2]           // FVG baissier : vide entre high[0] et low[2]
+
+dispUp = gapUp and isDispM and close[1] > open[1]
+dispDn = gapDn and isDispM and close[1] < open[1]
+
+plotshape(showDisp and dispUp, title="Deplacement haussier", style=shape.triangleup,
+     location=location.belowbar, color=cDisp, size=size.tiny, offset=-1)
+plotshape(showDisp and dispDn, title="Deplacement baissier", style=shape.triangledown,
+     location=location.abovebar, color=cDisp, size=size.tiny, offset=-1)
+
+makeFvg = showLtfFvg and (not onlyDispFvg or dispUp or dispDn)
+
+if makeFvg and gapUp and (not onlyDispFvg or dispUp)
+    top = low
+    bot = high[2]
+    b   = box.new(bar_index - 2, top, bar_index + 3, bot, bgcolor=cBull,
+             border_color=color.new(#089981, 55), border_width=1)
+    pushBox(bullFvg, b, ltfMaxBoxes)
+    if showCE
+        ce = (top + bot) / 2
+        l  = line.new(bar_index - 2, ce, bar_index + 3, ce, color=color.new(#089981, 25),
+                 style=line.style_dotted, width=1)
+        pushLine(bullCE, l, ltfMaxBoxes)
+
+if makeFvg and gapDn and (not onlyDispFvg or dispDn)
+    top = low[2]
+    bot = high
+    b   = box.new(bar_index - 2, top, bar_index + 3, bot, bgcolor=cBear,
+             border_color=color.new(#f23645, 55), border_width=1)
+    pushBox(bearFvg, b, ltfMaxBoxes)
+    if showCE
+        ce = (top + bot) / 2
+        l  = line.new(bar_index - 2, ce, bar_index + 3, ce, color=color.new(#f23645, 25),
+                 style=line.style_dotted, width=1)
+        pushLine(bearCE, l, ltfMaxBoxes)
+
+// Extension + mitigation (un FVG totalement comble disparait)
+if array.size(bullFvg) > 0
+    for i = array.size(bullFvg) - 1 to 0
+        b = array.get(bullFvg, i)
+        if low <= box.get_bottom(b)
+            box.delete(b)
+            array.remove(bullFvg, i)
+        else
+            box.set_right(b, bar_index + 3)
+
+if array.size(bearFvg) > 0
+    for i = array.size(bearFvg) - 1 to 0
+        b = array.get(bearFvg, i)
+        if high >= box.get_top(b)
+            box.delete(b)
+            array.remove(bearFvg, i)
+        else
+            box.set_right(b, bar_index + 3)
+
+if array.size(bullCE) > 0
+    for i = array.size(bullCE) - 1 to 0
+        l = array.get(bullCE, i)
+        if low <= line.get_y1(l)
+            line.delete(l)
+            array.remove(bullCE, i)
+        else
+            line.set_x2(l, bar_index + 3)
+
+if array.size(bearCE) > 0
+    for i = array.size(bearCE) - 1 to 0
+        l = array.get(bearCE, i)
+        if high >= line.get_y1(l)
+            line.delete(l)
+            array.remove(bearCE, i)
+        else
+            line.set_x2(l, bar_index + 3)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  2. FVG DU TIMEFRAME SUPERIEUR (zone de depart du modele)
+// ═══════════════════════════════════════════════════════════════════════════════
+[hH1, hL1, hH3, hL3, hTime] = request.security(syminfo.tickerid, htfTF,
+     [high[1], low[1], high[3], low[3], time], lookahead=barmerge.lookahead_off)
+
+newHtfBar = hTime != hTime[1]
+htfSecs   = timeframe.in_seconds(htfTF)
+curSecs   = timeframe.in_seconds(timeframe.period)
+barsPerH  = int(math.max(1, math.round(htfSecs / math.max(curSecs, 1))))
+
+if showHtfFvg and newHtfBar and not na(hL1) and not na(hH3)
+    if hL1 > hH3 and (hL1 - hH3) >= htfMinSize
+        b = box.new(bar_index - barsPerH * 3, hL1, bar_index + 5, hH3, bgcolor=cHtfBull,
+                 border_color=color.new(#089981, 30), border_width=2,
+                 text="FVG " + htfTF, text_size=size.tiny,
+                 text_color=color.new(#089981, 10), text_halign=text.align_left)
+        pushBox(htfBull, b, htfMaxBoxes)
+    if hH1 < hL3 and (hL3 - hH1) >= htfMinSize
+        b = box.new(bar_index - barsPerH * 3, hL3, bar_index + 5, hH1, bgcolor=cHtfBear,
+                 border_color=color.new(#f23645, 30), border_width=2,
+                 text="FVG " + htfTF, text_size=size.tiny,
+                 text_color=color.new(#f23645, 10), text_halign=text.align_left)
+        pushBox(htfBear, b, htfMaxBoxes)
+
+if array.size(htfBull) > 0
+    for i = array.size(htfBull) - 1 to 0
+        b = array.get(htfBull, i)
+        if low <= box.get_bottom(b)
+            box.delete(b)
+            array.remove(htfBull, i)
+        else
+            box.set_right(b, bar_index + 5)
+
+if array.size(htfBear) > 0
+    for i = array.size(htfBear) - 1 to 0
+        b = array.get(htfBear, i)
+        if high >= box.get_top(b)
+            box.delete(b)
+            array.remove(htfBear, i)
+        else
+            box.set_right(b, bar_index + 5)
+
+// Le prix est-il dans un FVG HTF non mitige ?
+inHtfBull = false
+if array.size(htfBull) > 0
+    for i = 0 to array.size(htfBull) - 1
+        b = array.get(htfBull, i)
+        if low <= box.get_top(b) and high >= box.get_bottom(b)
+            inHtfBull := true
+inHtfBear = false
+if array.size(htfBear) > 0
+    for i = 0 to array.size(htfBear) - 1
+        b = array.get(htfBear, i)
+        if low <= box.get_top(b) and high >= box.get_bottom(b)
+            inHtfBear := true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  3. NIVEAUX DE LIQUIDITE + SWEEP
+// ═══════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low,  pivLen, pivLen)
+
+var float swingHigh = na
+var float swingLow  = na
+var int   swingHighBar = na
+var int   swingLowBar  = na
+var bool  shSwept   = false      // meche au-dessus, cloture en dessous
+var bool  slSwept   = false
+var bool  shBroken  = false      // cloture au-dessus  -> BOS / CHoCH
+var bool  slBroken  = false
+var array<line> liqLines = array.new<line>()
+
+if not na(ph)
+    swingHigh    := ph
+    swingHighBar := bar_index - pivLen
+    shSwept      := false
+    shBroken     := false
+    if showPivots
+        l = line.new(swingHighBar, ph, bar_index, ph, color=color.new(#f23645, 55),
+                 style=line.style_dashed, width=1, extend=extend.right)
+        pushLine(liqLines, l, 12)
+
+if not na(pl)
+    swingLow    := pl
+    swingLowBar := bar_index - pivLen
+    slSwept     := false
+    slBroken    := false
+    if showPivots
+        l = line.new(swingLowBar, pl, bar_index, pl, color=color.new(#089981, 55),
+                 style=line.style_dashed, width=1, extend=extend.right)
+        pushLine(liqLines, l, 12)
+
+// Un sweep = la meche depasse le niveau, la cloture revient dedans.
+tookLowWick   = not na(swingLow)  and low  < swingLow
+closedBackUp  = close > swingLow
+longWickDown  = dnWick >= wickRatio * bodyN
+sweepLow      = showSweep and not slSwept and tookLowWick and closedBackUp and longWickDown and sigOK
+
+tookHighWick  = not na(swingHigh) and high > swingHigh
+closedBackDn  = close < swingHigh
+longWickUp    = upWick >= wickRatio * bodyN
+sweepHigh     = showSweep and not shSwept and tookHighWick and closedBackDn and longWickUp and sigOK
+
+if sweepLow
+    slSwept := true
+if sweepHigh
+    shSwept := true
+
+plotshape(sweepLow,  title="Sweep bas (liquidite prise)",  style=shape.labelup,
+     location=location.belowbar, color=cSweep, textcolor=color.white,
+     text="SWEEP", size=size.tiny)
+plotshape(sweepHigh, title="Sweep haut (liquidite prise)", style=shape.labeldown,
+     location=location.abovebar, color=cSweep, textcolor=color.white,
+     text="SWEEP", size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  4. STRUCTURE : BOS / CHoCH (cloture obligatoire, pas une meche)
+// ═══════════════════════════════════════════════════════════════════════════════
+var int trend = 0
+
+bosUp = showBos and not na(swingHigh) and not shBroken and close > swingHigh
+bosDn = showBos and not na(swingLow)  and not slBroken and close < swingLow
+
+if bosUp
+    shBroken := true
+    txt = trend < 0 ? "CHoCH" : "BOS"
+    label.new(bar_index, swingHigh, txt, style=label.style_label_down,
+         color=color.new(#089981, 15), textcolor=color.white, size=size.tiny)
+    line.new(swingHighBar, swingHigh, bar_index, swingHigh, color=#089981, width=1)
+    trend := 1
+
+if bosDn
+    slBroken := true
+    txt = trend > 0 ? "CHoCH" : "BOS"
+    label.new(bar_index, swingLow, txt, style=label.style_label_up,
+         color=color.new(#f23645, 15), textcolor=color.white, size=size.tiny)
+    line.new(swingLowBar, swingLow, bar_index, swingLow, color=#f23645, width=1)
+    trend := -1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  5. ORDER BLOCK : derniere bougie opposee avant le deplacement
+// ═══════════════════════════════════════════════════════════════════════════════
+if showOB and dispUp
+    idx = -1
+    for i = 1 to obLookback
+        if close[i] < open[i]
+            idx := i
+            break
+    if idx >= 0
+        b = box.new(bar_index - idx, high[idx], bar_index + 3, low[idx], bgcolor=cOB,
+                 border_color=color.new(#ff9800, 40), border_width=1,
+                 text="OB", text_size=size.tiny, text_color=color.new(#ff9800, 10))
+        pushBox(obBoxes, b, obMaxBoxes)
+
+if showOB and dispDn
+    idx = -1
+    for i = 1 to obLookback
+        if close[i] > open[i]
+            idx := i
+            break
+    if idx >= 0
+        b = box.new(bar_index - idx, high[idx], bar_index + 3, low[idx], bgcolor=cOB,
+                 border_color=color.new(#ff9800, 40), border_width=1,
+                 text="OB", text_size=size.tiny, text_color=color.new(#ff9800, 10))
+        pushBox(obBoxes, b, obMaxBoxes)
+
+if array.size(obBoxes) > 0
+    for i = 0 to array.size(obBoxes) - 1
+        box.set_right(array.get(obBoxes, i), bar_index + 3)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  6. RANGE ASIE (la liquidite que Londres vient chercher)
+// ═══════════════════════════════════════════════════════════════════════════════
+var float asiaHi  = na
+var float asiaLo  = na
+var int   asiaBar = na
+var box   asiaBox = na
+
+if showAsiaBx and inAsia
+    if not inAsia[1]
+        asiaHi  := high
+        asiaLo  := low
+        asiaBar := bar_index
+        asiaBox := box.new(bar_index, high, bar_index, low,
+                     bgcolor=color.new(color.gray, 90),
+                     border_color=color.new(color.gray, 45), border_width=1,
+                     text="Asie", text_size=size.tiny, text_color=color.new(color.gray, 20))
+    else
+        asiaHi := math.max(asiaHi, high)
+        asiaLo := math.min(asiaLo, low)
+        if not na(asiaBox)
+            box.set_top(asiaBox, asiaHi)
+            box.set_bottom(asiaBox, asiaLo)
+            box.set_right(asiaBox, bar_index)
+
+if showAsiaBx and not inAsia and not na(asiaBox) and not na(asiaHi)
+    box.set_right(asiaBox, bar_index)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  7. SETUP COMPLET : FVG HTF + sweep + deplacement dans la bonne direction
+// ═══════════════════════════════════════════════════════════════════════════════
+var int barsSinceSweepLow  = 9999
+var int barsSinceSweepHigh = 9999
+barsSinceSweepLow  := sweepLow  ? 0 : barsSinceSweepLow  + 1
+barsSinceSweepHigh := sweepHigh ? 0 : barsSinceSweepHigh + 1
+
+setupLong  = dispUp and barsSinceSweepLow  <= 5 and inHtfBull and sigOK
+setupShort = dispDn and barsSinceSweepHigh <= 5 and inHtfBear and sigOK
+
+plotshape(setupLong,  title="SETUP LONG",  style=shape.labelup,
+     location=location.belowbar, color=color.new(#00c853, 0), textcolor=color.white,
+     text="A+", size=size.small)
+plotshape(setupShort, title="SETUP SHORT", style=shape.labeldown,
+     location=location.abovebar, color=color.new(#d50000, 0), textcolor=color.white,
+     text="A+", size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  8. TABLEAU DE BORD
+// ═══════════════════════════════════════════════════════════════════════════════
+var string lastSig = "—"
+if setupLong
+    lastSig := "SETUP LONG"
+else if setupShort
+    lastSig := "SETUP SHORT"
+else if sweepLow
+    lastSig := "Sweep bas"
+else if sweepHigh
+    lastSig := "Sweep haut"
+else if dispUp
+    lastSig := "Deplacement haussier"
+else if dispDn
+    lastSig := "Deplacement baissier"
+
+kzName = inSB ? "Silver Bullet" : inNY ? "New York" : inLondon ? "Londres" : inAsia ? "Asie" : "Hors killzone"
+trName = trend > 0 ? "Haussiere" : trend < 0 ? "Baissiere" : "Indefinie"
+trCol  = trend > 0 ? #089981 : trend < 0 ? #f23645 : color.gray
+
+var table panel = table.new(position.top_right, 2, 8, border_width=1,
+     frame_color=color.new(color.gray, 60), frame_width=1)
+
+if showPanel and barstate.islast
+    table.cell(panel, 0, 0, "SMC SCANNER", bgcolor=color.new(#2962ff, 20),
+         text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 0, syminfo.ticker + " " + timeframe.period,
+         bgcolor=color.new(#2962ff, 20), text_color=color.white, text_size=size.small)
+
+    table.cell(panel, 0, 1, "Structure", text_size=size.tiny, text_color=color.gray)
+    table.cell(panel, 1, 1, trName, text_size=size.tiny, text_color=trCol)
+
+    table.cell(panel, 0, 2, "Session", text_size=size.tiny, text_color=color.gray)
+    table.cell(panel, 1, 2, kzName, text_size=size.tiny,
+         text_color=inKZ ? #089981 : color.gray)
+
+    table.cell(panel, 0, 3, "Dans FVG " + htfTF, text_size=size.tiny, text_color=color.gray)
+    table.cell(panel, 1, 3, inHtfBull ? "Haussier" : inHtfBear ? "Baissier" : "Non",
+         text_size=size.tiny, text_color=inHtfBull ? #089981 : inHtfBear ? #f23645 : color.gray)
+
+    table.cell(panel, 0, 4, "FVG " + htfTF + " actifs", text_size=size.tiny, text_color=color.gray)
+    table.cell(panel, 1, 4, str.tostring(array.size(htfBull)) + " / " + str.tostring(array.size(htfBear)),
+         text_size=size.tiny, text_color=color.gray)
+
+    table.cell(panel, 0, 5, "ATR(" + str.tostring(atrLen) + ")", text_size=size.tiny, text_color=color.gray)
+    table.cell(panel, 1, 5, str.tostring(atr, format.mintick), text_size=size.tiny, text_color=color.gray)
+
+    table.cell(panel, 0, 6, "Corps mini deplacement", text_size=size.tiny, text_color=color.gray)
+    table.cell(panel, 1, 6, str.tostring(atr * dispAtrMult, format.mintick),
+         text_size=size.tiny, text_color=color.gray)
+
+    table.cell(panel, 0, 7, "Dernier signal", text_size=size.tiny, text_color=color.gray)
+    table.cell(panel, 1, 7, lastSig, text_size=size.tiny, text_color=color.white)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  9. ALERTES
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(setupLong,  "Setup LONG A+",  "SMC : sweep bas + deplacement haussier dans un FVG HTF")
+alertcondition(setupShort, "Setup SHORT A+", "SMC : sweep haut + deplacement baissier dans un FVG HTF")
+alertcondition(sweepLow,   "Sweep bas",      "SMC : liquidite basse prise, meche sans cloture")
+alertcondition(sweepHigh,  "Sweep haut",     "SMC : liquidite haute prise, meche sans cloture")
+alertcondition(dispUp,     "Deplacement haussier", "SMC : bougie de deplacement haussiere + FVG")
+alertcondition(dispDn,     "Deplacement baissier", "SMC : bougie de deplacement baissiere + FVG")
+alertcondition(bosUp,      "BOS / CHoCH haussier", "SMC : cassure de structure haussiere en cloture")
+alertcondition(bosDn,      "BOS / CHoCH baissier", "SMC : cassure de structure baissiere en cloture")

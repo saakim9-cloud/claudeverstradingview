@@ -1,0 +1,270 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MSNR Strategy (A/V levels + Quasimodo) — backtestable version
+//
+//  Levels
+//    A-Level  (resistance): bullish candle → bearish candle, at the bullish close
+//    V-Level  (support)   : bearish candle → bullish candle, at the bearish close
+//    QM Sell / QM Buy     : Quasimodo left shoulder on the chart timeframe
+//
+//  Entry (on candle close, confirmed bars only)
+//    SELL : a FRESH resistance is touched by the wick and the body closes below it
+//    BUY  : a FRESH support    is touched by the wick and the body closes above it
+//    Each level is traded once (after the touch it is unfresh).
+//    A body close through a level = broken → level is removed.
+//
+//  Exit
+//    Stop  : behind the level + ATR × multiplier
+//    Target: fixed R:R, or the next opposite MSNR level (with a minimum R:R)
+//
+//  Filters: London + New York session, optional EMA trend filter.
+// ═══════════════════════════════════════════════════════════════════════════════
+strategy("MSNR Strategy (A/V + QM)", shorttitle = "MSNR Strat", overlay = true,
+     initial_capital   = 10000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.02,
+     slippage          = 2,
+     pyramiding        = 0,
+     max_lines_count   = 500,
+     max_labels_count  = 500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+grpTF  = "MSNR Timeframes"
+tf1On  = input.bool(true, "", inline = "tf1", group = grpTF)
+tf1    = input.timeframe("240", "TF 1", inline = "tf1", group = grpTF)
+tf2On  = input.bool(true, "", inline = "tf2", group = grpTF)
+tf2    = input.timeframe("60",  "TF 2", inline = "tf2", group = grpTF)
+useQM  = input.bool(true, "Trade QM levels (chart TF)", group = grpTF)
+qmLen  = input.int(5, "QM swing pivot length", minval = 2, maxval = 30, group = grpTF)
+maxLv  = input.int(8, "Max active levels per source", minval = 1, maxval = 50, group = grpTF)
+
+grpR     = "Risk & Exits"
+riskPct  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, step = 0.1, group = grpR)
+atrLen   = input.int(14, "ATR length", group = grpR)
+slMult   = input.float(0.5, "Stop beyond level (× ATR)", minval = 0.1, step = 0.1, group = grpR)
+tpMode   = input.string("Next level", "Target", options = ["Next level", "Fixed R:R"], group = grpR)
+rrFixed  = input.float(2.0, "Fixed R:R", minval = 0.5, step = 0.1, group = grpR)
+rrMin    = input.float(1.5, "Minimum R:R (Next level mode)", minval = 0.5, step = 0.1, group = grpR)
+beOn     = input.bool(false, "Move stop to break-even at 1R", group = grpR)
+
+grpF      = "Filters"
+useSess   = input.bool(true, "Trade only in sessions", group = grpF)
+sessTz    = input.string("GMT+0", "Timezone", group = grpF)
+sessLon   = input.session("0800-1200", "London",   group = grpF)
+sessNY    = input.session("1300-1700", "New York", group = grpF)
+useTrend  = input.bool(false, "EMA trend filter (sell below / buy above)", group = grpF)
+emaLen    = input.int(200, "EMA length", group = grpF)
+allowLong = input.bool(true, "Allow longs",  group = grpF)
+allowShort= input.bool(true, "Allow shorts", group = grpF)
+
+grpV      = "Visuals"
+showLines = input.bool(true, "Show active levels", group = grpV)
+resCol    = input.color(#f23645, "Resistance", inline = "c", group = grpV)
+supCol    = input.color(#089981, "Support",    inline = "c", group = grpV)
+showDash  = input.bool(true, "Show results table", group = grpV)
+
+// ─── LEVEL STORAGE ────────────────────────────────────────────────────────────
+type Lvl
+    float  price
+    bool   isRes
+    string src
+    int    born
+    line   ln
+
+var array<Lvl> levels = array.new<Lvl>()
+
+removeAt(int i) =>
+    l = levels.get(i)
+    line.delete(l.ln)
+    levels.remove(i)
+
+addLevel(float price, bool isRes, string src, int t0) =>
+    dup = false
+    for l in levels
+        if l.src == src and l.price == price
+            dup := true
+    if not dup and not na(price)
+        ln = showLines ? line.new(t0, price, time, price, xloc = xloc.bar_time, extend = extend.right,
+             color = color.new(isRes ? resCol : supCol, 30), width = 1) : na
+        levels.push(Lvl.new(price, isRes, src, bar_index, ln))
+        cnt = 0
+        for i = levels.size() - 1 to 0
+            if levels.get(i).src == src
+                cnt += 1
+                if cnt > maxLv
+                    removeAt(i)
+
+// ─── HTF A/V DETECTION (non-repainting) ───────────────────────────────────────
+msnr() =>
+    isA = close[2] > open[2] and close[1] < open[1]
+    isV = close[2] < open[2] and close[1] > open[1]
+    [isA, isV, close[2], time[2], time]
+
+[a1, v1, p1, t1, n1] = request.security(syminfo.tickerid, tf1, msnr(), lookahead = barmerge.lookahead_on)
+[a2, v2, p2, t2, n2] = request.security(syminfo.tickerid, tf2, msnr(), lookahead = barmerge.lookahead_on)
+
+chartSec = timeframe.in_seconds(timeframe.period)
+ch1 = ta.change(n1)
+ch2 = ta.change(n2)
+new1 = tf1On and timeframe.in_seconds(tf1) >= chartSec and ch1 != 0
+new2 = tf2On and timeframe.in_seconds(tf2) >= chartSec and ch2 != 0
+
+if new1 and (a1 or v1)
+    addLevel(p1, a1, "TF1", t1)
+if new2 and (a2 or v2)
+    addLevel(p2, a2, "TF2", t2)
+
+// ─── QUASIMODO ON CHART TF ────────────────────────────────────────────────────
+var array<float> swP  = array.new<float>()
+var array<int>   swT  = array.new<int>()
+var array<bool>  swHi = array.new<bool>()
+
+ph = ta.pivothigh(high, qmLen, qmLen)
+pl = ta.pivotlow(low,  qmLen, qmLen)
+
+pushSwing(float p, int t, bool hi) =>
+    if swHi.size() > 0 and swHi.last() == hi
+        if (hi and p > swP.last()) or (not hi and p < swP.last())
+            swP.set(swP.size() - 1, p)
+            swT.set(swT.size() - 1, t)
+    else
+        swP.push(p)
+        swT.push(t)
+        swHi.push(hi)
+        if swP.size() > 6
+            swP.shift()
+            swT.shift()
+            swHi.shift()
+
+if not na(ph)
+    pushSwing(ph, time[qmLen], true)
+if not na(pl)
+    pushSwing(pl, time[qmLen], false)
+
+if useQM and (not na(ph) or not na(pl)) and swP.size() >= 4
+    n  = swP.size()
+    q1 = swP.get(n - 4)
+    q2 = swP.get(n - 3)
+    q3 = swP.get(n - 2)
+    q4 = swP.get(n - 1)
+    h1 = swHi.get(n - 4)
+    if h1 and q3 > q1 and q4 < q2 and close < q1          // H, L, HH, LL → sell at H
+        addLevel(q1, true, "QM", swT.get(n - 4))
+    if not h1 and q3 < q1 and q4 > q2 and close > q1      // L, H, LL, HH → buy at L
+        addLevel(q1, false, "QM", swT.get(n - 4))
+
+// ─── FILTERS ──────────────────────────────────────────────────────────────────
+atr   = ta.atr(atrLen)
+ema   = ta.ema(close, emaLen)
+inSes = not useSess or not na(time(timeframe.period, sessLon, sessTz)) or not na(time(timeframe.period, sessNY, sessTz))
+
+// ─── SIGNALS: fresh level touched + rejection close ──────────────────────────
+float sigLevel = na
+bool  sigSell  = false
+string sigSrc  = ""
+
+if barstate.isconfirmed and levels.size() > 0
+    for i = levels.size() - 1 to 0
+        l = levels.get(i)
+        if bar_index <= l.born
+            continue
+        broken  = l.isRes ? close > l.price : close < l.price
+        touched = l.isRes ? high >= l.price : low <= l.price
+        if broken
+            removeAt(i)
+        else if touched
+            if na(sigLevel)
+                sigLevel := l.price
+                sigSell  := l.isRes
+                sigSrc   := l.src
+            if showLines and not na(l.ln)
+                line.set_extend(l.ln, extend.none)
+                line.set_x2(l.ln, time)
+                line.set_style(l.ln, line.style_dashed)
+                l.ln := na          // keep the drawing, stop tracking it
+            levels.remove(i)
+
+// nearest opposite level for the "Next level" target
+nextTarget(bool forSell, float fromPrice) =>
+    float best = na
+    for l in levels
+        if forSell and not l.isRes and l.price < fromPrice
+            best := na(best) ? l.price : math.max(best, l.price)
+        if not forSell and l.isRes and l.price > fromPrice
+            best := na(best) ? l.price : math.min(best, l.price)
+    best
+
+// ─── ORDERS ───────────────────────────────────────────────────────────────────
+var float entryPx = na
+var float stopPx  = na
+var float riskPts = na
+var float tgtPx   = na
+
+flat = strategy.position_size == 0
+
+if not na(sigLevel) and flat and inSes
+    isSell = sigSell
+    okDir  = isSell ? allowShort : allowLong
+    okTrnd = not useTrend or (isSell ? close < ema : close > ema)
+    stop   = isSell ? sigLevel + atr * slMult : sigLevel - atr * slMult
+    risk   = math.abs(close - stop)
+    float tgt = na
+    if tpMode == "Fixed R:R"
+        tgt := isSell ? close - risk * rrFixed : close + risk * rrFixed
+    else
+        nt = nextTarget(isSell, close)
+        if not na(nt) and math.abs(nt - close) >= risk * rrMin
+            tgt := nt
+    qty = risk > 0 ? (strategy.equity * riskPct / 100) / (risk * syminfo.pointvalue) : 0.0
+    if okDir and okTrnd and not na(tgt) and qty > 0
+        id = isSell ? "Sell" : "Buy"
+        strategy.entry(id, isSell ? strategy.short : strategy.long, qty = qty,
+             comment = (isSell ? "S " : "B ") + sigSrc)
+        strategy.exit("X " + id, id, stop = stop, limit = tgt)
+        entryPx := close
+        stopPx  := stop
+        riskPts := risk
+        tgtPx   := tgt
+
+// optional break-even at 1R
+if beOn and strategy.position_size != 0 and not na(riskPts)
+    if strategy.position_size > 0 and high >= entryPx + riskPts and stopPx < entryPx
+        stopPx := entryPx
+        strategy.exit("X Buy", "Buy", stop = stopPx, limit = tgtPx)
+    if strategy.position_size < 0 and low <= entryPx - riskPts and stopPx > entryPx
+        stopPx := entryPx
+        strategy.exit("X Sell", "Sell", stop = stopPx, limit = tgtPx)
+
+// ─── VISUALS ──────────────────────────────────────────────────────────────────
+plot(useTrend ? ema : na, "EMA", color = color.new(color.gray, 30))
+bgcolor(useSess and inSes ? color.new(color.yellow, 94) : na, title = "Session")
+
+var table dash = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 80),
+     border_color = color.new(color.white, 70), border_width = 1)
+
+if showDash and barstate.islast
+    tot  = strategy.closedtrades
+    wins = strategy.wintrades
+    wr   = tot > 0 ? wins * 100.0 / tot : 0.0
+    pf   = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    ddp  = strategy.max_drawdown / strategy.initial_capital * 100
+    np   = strategy.netprofit
+    npp  = np / strategy.initial_capital * 100
+    w = color.white
+    table.cell(dash, 0, 0, "MSNR Results", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.silver, text_size = size.small)
+    table.cell(dash, 0, 1, "Trades",        text_color = w, text_size = size.small)
+    table.cell(dash, 1, 1, str.tostring(tot), text_color = w, text_size = size.small)
+    table.cell(dash, 0, 2, "Win rate",      text_color = w, text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(wr, "#.#") + " %", text_color = wr >= 50 ? color.lime : color.orange, text_size = size.small)
+    table.cell(dash, 0, 3, "Net profit",    text_color = w, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(np, "#.##") + "  (" + str.tostring(npp, "#.#") + " %)",
+         text_color = np >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(dash, 0, 4, "Profit factor", text_color = w, text_size = size.small)
+    table.cell(dash, 1, 4, na(pf) ? "-" : str.tostring(pf, "#.##"), text_color = w, text_size = size.small)
+    table.cell(dash, 0, 5, "Max drawdown",  text_color = w, text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(ddp, "#.#") + " %", text_color = color.orange, text_size = size.small)
+    table.cell(dash, 0, 6, "Active levels", text_color = w, text_size = size.small)
+    table.cell(dash, 1, 6, str.tostring(levels.size()), text_color = w, text_size = size.small)

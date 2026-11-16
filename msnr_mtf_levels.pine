@@ -11,6 +11,11 @@
 //  Unfresh : a wick touched the level                        (dashed line)
 //  Broken  : a candle BODY closed through the level          (deleted / dotted)
 //
+//  Gap     : two consecutive candles of the same colour → level at the close of
+//            the first one (bull+bull → support, bear+bear → resistance)
+//  QM      : Quasimodo pattern on the chart timeframe (H-L-HH-LL / L-H-LL-HH)
+//  Sessions: Asia / London / New York range boxes on a time basis
+//
 //  Levels are detected on up to 3 higher timeframes using confirmed candles only
 //  (no repainting) and printed with their exact price on the chart.
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -37,6 +42,28 @@ colorMode   = input.string("Timeframe", "Color levels by", options = ["Timeframe
 aCol        = input.color(#f23645, "A-Level color", inline = "typ", group = grpL)
 vCol        = input.color(#089981, "V-Level color", inline = "typ", group = grpL)
 lineWidth   = input.int(2, "Line width", minval = 1, maxval = 4, group = grpL)
+showGaps    = input.bool(false, "Show Gap levels", inline = "gap", group = grpL)
+gCol        = input.color(#9c27b0, "", inline = "gap", group = grpL)
+
+grpQ     = "Quasimodo (QM) - chart timeframe"
+showQM   = input.bool(true, "Show QM levels", group = grpQ)
+qmLen    = input.int(5, "Swing pivot length", minval = 2, maxval = 30, group = grpQ)
+qmMax    = input.int(4, "Max active QM levels", minval = 1, maxval = 20, group = grpQ)
+qmSell   = input.color(#ff5252, "QM Sell", inline = "qmc", group = grpQ)
+qmBuy    = input.color(#00e676, "QM Buy",  inline = "qmc", group = grpQ)
+
+grpS     = "Sessions (time)"
+showSess = input.bool(true, "Show session boxes", group = grpS)
+sessTz   = input.string("GMT+0", "Timezone", group = grpS)
+asOn     = input.bool(true, "", inline = "as", group = grpS)
+asSess   = input.session("0000-0800", "Asia",     inline = "as", group = grpS)
+asCol    = input.color(color.new(#787b86, 88), "", inline = "as", group = grpS)
+loOn     = input.bool(true, "", inline = "lo", group = grpS)
+loSess   = input.session("0800-1300", "London",   inline = "lo", group = grpS)
+loCol    = input.color(color.new(#2962ff, 88), "", inline = "lo", group = grpS)
+nyOn     = input.bool(true, "", inline = "ny", group = grpS)
+nySess   = input.session("1300-2100", "New York", inline = "ny", group = grpS)
+nyCol    = input.color(color.new(#ff9800, 88), "", inline = "ny", group = grpS)
 
 grpLb       = "Price Labels"
 showLabels  = input.bool(true, "Show price labels", group = grpLb)
@@ -59,7 +86,8 @@ dashPos = dashPosIn == "Top Left" ? position.top_left : dashPosIn == "Bottom Rig
 // ─── TYPES & STATE ────────────────────────────────────────────────────────────
 type Lvl
     float  price
-    bool   isA
+    bool   isA     // true = resistance, false = support
+    string kind    // "A", "V" or "G"
     int    tfIdx
     string tfName
     int    state   // 0 = fresh, 1 = unfresh, 2 = broken
@@ -85,11 +113,11 @@ tfColor(int idx) =>
     idx == 1 ? tf1Col : idx == 2 ? tf2Col : tf3Col
 
 levelColor(Lvl l) =>
-    colorMode == "Timeframe" ? tfColor(l.tfIdx) : l.isA ? aCol : vCol
+    colorMode == "Timeframe" ? tfColor(l.tfIdx) : l.kind == "G" ? gCol : l.isA ? aCol : vCol
 
 levelText(Lvl l) =>
     tag = l.state == 0 ? "" : l.state == 1 ? " (U)" : " (X)"
-    l.tfName + " " + (l.isA ? "A" : "V") + tag + "  " + str.tostring(l.price, format.mintick)
+    l.tfName + " " + l.kind + tag + "  " + str.tostring(l.price, format.mintick)
 
 applyStyle(Lvl l) =>
     c = levelColor(l)
@@ -118,14 +146,14 @@ removeAt(int i) =>
     label.delete(l.lb)
     levels.remove(i)
 
-addLevel(float price, bool isA, int tfIdx, string tfName, int t0) =>
+addLevel(float price, bool isA, string kind, int tfIdx, string tfName, int t0) =>
     // skip duplicates of the same timeframe & price
     dup = false
     for l in levels
         if l.tfIdx == tfIdx and l.state < 2 and l.price == price
             dup := true
     if not dup
-        lv = Lvl.new(price, isA, tfIdx, tfName, 0, bar_index, na, na)
+        lv = Lvl.new(price, isA, kind, tfIdx, tfName, 0, bar_index, na, na)
         c  = levelColor(lv)
         lv.ln := line.new(t0, price, time, price, xloc = xloc.bar_time, extend = extend.right,
              color = c, width = lineWidth, style = line.style_solid)
@@ -150,11 +178,13 @@ addLevel(float price, bool isA, int tfIdx, string tfName, int t0) =>
 msnr() =>
     isA = close[2] > open[2] and close[1] < open[1]
     isV = close[2] < open[2] and close[1] > open[1]
-    [isA, isV, close[2], time[2], time]
+    gR  = close[2] < open[2] and close[1] < open[1]   // bearish gap → resistance
+    gS  = close[2] > open[2] and close[1] > open[1]   // bullish gap → support
+    [isA, isV, gR, gS, close[2], time[2], time]
 
-[a1, v1, p1, t1, n1] = request.security(syminfo.tickerid, tf1, msnr(), lookahead = barmerge.lookahead_on)
-[a2, v2, p2, t2, n2] = request.security(syminfo.tickerid, tf2, msnr(), lookahead = barmerge.lookahead_on)
-[a3, v3, p3, t3, n3] = request.security(syminfo.tickerid, tf3, msnr(), lookahead = barmerge.lookahead_on)
+[a1, v1, gr1, gs1, p1, t1, n1] = request.security(syminfo.tickerid, tf1, msnr(), lookahead = barmerge.lookahead_on)
+[a2, v2, gr2, gs2, p2, t2, n2] = request.security(syminfo.tickerid, tf2, msnr(), lookahead = barmerge.lookahead_on)
+[a3, v3, gr3, gs3, p3, t3, n3] = request.security(syminfo.tickerid, tf3, msnr(), lookahead = barmerge.lookahead_on)
 
 ch1 = ta.change(n1)
 ch2 = ta.change(n2)
@@ -164,11 +194,17 @@ new2 = tf2On and tfAllowed(tf2) and ch2 != 0
 new3 = tf3On and tfAllowed(tf3) and ch3 != 0
 
 if new1 and (a1 or v1)
-    addLevel(p1, a1, 1, tfText(tf1), t1)
+    addLevel(p1, a1, a1 ? "A" : "V", 1, tfText(tf1), t1)
+if new1 and showGaps and (gr1 or gs1)
+    addLevel(p1, gr1, "G", 1, tfText(tf1), t1)
 if new2 and (a2 or v2)
-    addLevel(p2, a2, 2, tfText(tf2), t2)
+    addLevel(p2, a2, a2 ? "A" : "V", 2, tfText(tf2), t2)
+if new2 and showGaps and (gr2 or gs2)
+    addLevel(p2, gr2, "G", 2, tfText(tf2), t2)
 if new3 and (a3 or v3)
-    addLevel(p3, a3, 3, tfText(tf3), t3)
+    addLevel(p3, a3, a3 ? "A" : "V", 3, tfText(tf3), t3)
+if new3 and showGaps and (gr3 or gs3)
+    addLevel(p3, gr3, "G", 3, tfText(tf3), t3)
 
 // ─── FRESH / UNFRESH / BROKEN TRACKING ────────────────────────────────────────
 touchedNow = false
@@ -233,10 +269,10 @@ if showDash and barstate.islast
         if l.state < 2
             if l.price > close and (na(resP) or l.price < resP)
                 resP := l.price
-                resT := l.tfName + " " + (l.isA ? "A" : "V") + (l.state == 1 ? " (U)" : "")
+                resT := l.tfName + " " + l.kind + (l.state == 1 ? " (U)" : "")
             if l.price < close and (na(supP) or l.price > supP)
                 supP := l.price
-                supT := l.tfName + " " + (l.isA ? "A" : "V") + (l.state == 1 ? " (U)" : "")
+                supT := l.tfName + " " + l.kind + (l.state == 1 ? " (U)" : "")
             if l.tfIdx == 1
                 fr1 += l.state == 0 ? 1 : 0
                 un1 += l.state == 1 ? 1 : 0
@@ -278,3 +314,112 @@ if showDash and barstate.islast
     table.cell(dash, 0, 6, tfText(tf3),  text_color = tf3Col, text_size = size.small)
     table.cell(dash, 1, 6, tf3On and tfAllowed(tf3) ? "Fresh " + str.tostring(fr3) + " / Unfresh " + str.tostring(un3) : "off",
          text_color = txt, text_size = size.small)
+
+// ─── QUASIMODO (QM) ON CHART TIMEFRAME ────────────────────────────────────────
+//  Bearish QM: H → L → HH → LL (LL breaks L)  → sell level at the left shoulder H
+//  Bullish QM: L → H → LL → HH (HH breaks H)  → buy level at the left shoulder L
+type QM
+    float price
+    bool  isSell
+    int   born
+    line  ln
+    label lb
+
+var array<QM>    qms    = array.new<QM>()
+var array<float> swP    = array.new<float>()   // last swing prices
+var array<int>   swT    = array.new<int>()     // their times
+var array<bool>  swHi   = array.new<bool>()    // true = swing high
+
+ph = ta.pivothigh(high, qmLen, qmLen)
+pl = ta.pivotlow(low,  qmLen, qmLen)
+
+pushSwing(float p, int t, bool hi) =>
+    // keep swings alternating: replace the last one if it is the same type and more extreme
+    if swHi.size() > 0 and swHi.last() == hi
+        if (hi and p > swP.last()) or (not hi and p < swP.last())
+            swP.set(swP.size() - 1, p)
+            swT.set(swT.size() - 1, t)
+    else
+        swP.push(p)
+        swT.push(t)
+        swHi.push(hi)
+        if swP.size() > 6
+            swP.shift()
+            swT.shift()
+            swHi.shift()
+
+newQM(float p, bool sell, int t0) =>
+    c = sell ? qmSell : qmBuy
+    ln = line.new(t0, p, time, p, xloc = xloc.bar_time, extend = extend.right, color = c, width = 2,
+         style = line.style_dashed)
+    lb = label.new(time, p, (sell ? "QM Sell  " : "QM Buy  ") + str.tostring(p, format.mintick),
+         xloc = xloc.bar_time, style = label.style_label_left, color = color.new(c, 15),
+         textcolor = color.black, size = lblSize)
+    qms.push(QM.new(p, sell, bar_index, ln, lb))
+    if qms.size() > qmMax
+        q = qms.shift()
+        line.delete(q.ln)
+        label.delete(q.lb)
+
+if showQM
+    if not na(ph)
+        pushSwing(ph, time[qmLen], true)
+    if not na(pl)
+        pushSwing(pl, time[qmLen], false)
+    // check the last four swings whenever a new pivot is confirmed
+    if (not na(ph) or not na(pl)) and swP.size() >= 4
+        n  = swP.size()
+        p1 = swP.get(n - 4)
+        p2 = swP.get(n - 3)
+        p3 = swP.get(n - 2)
+        p4 = swP.get(n - 1)
+        h1 = swHi.get(n - 4)
+        if h1 and p3 > p1 and p4 < p2          // H, L, HH, LL
+            newQM(p1, true, swT.get(n - 4))
+        if not h1 and p3 < p1 and p4 > p2      // L, H, LL, HH
+            newQM(p1, false, swT.get(n - 4))
+
+// QM is consumed once price trades back to it
+if showQM and qms.size() > 0
+    for i = qms.size() - 1 to 0
+        q = qms.get(i)
+        hit = q.isSell ? high >= q.price : low <= q.price
+        if hit and bar_index > q.born and barstate.isconfirmed
+            line.set_extend(q.ln, extend.none)
+            line.set_x2(q.ln, time)
+            line.set_style(q.ln, line.style_dotted)
+            label.delete(q.lb)
+            qms.remove(i)
+            if alertTouch
+                alert(syminfo.ticker + (q.isSell ? " QM Sell " : " QM Buy ") + str.tostring(q.price, format.mintick) +
+                     " reached", alert.freq_once_per_bar_close)
+
+if showQM and barstate.islast and showLabels
+    xq = time + labelOffset * timeframe.in_seconds() * 1000
+    for q in qms
+        q.lb.set_x(xq)
+
+// ─── SESSIONS (time-based range boxes) ────────────────────────────────────────
+sessBox(bool on, string sess, color col, string name) =>
+    var box  bx = na
+    var float hi = na
+    var float lo = na
+    inS   = on and showSess and not na(time(timeframe.period, sess, sessTz))
+    start = inS and not inS[1]
+    if start
+        hi := high
+        lo := low
+        bx := box.new(time, hi, time, lo, xloc = xloc.bar_time, border_color = color.new(col, 40),
+             bgcolor = col, text = name, text_size = size.tiny, text_color = color.new(col, 0),
+             text_halign = text.align_left, text_valign = text.align_top)
+    else if inS and not na(bx)
+        hi := math.max(hi, high)
+        lo := math.min(lo, low)
+        box.set_top(bx, hi)
+        box.set_bottom(bx, lo)
+        box.set_right(bx, time)
+    inS
+
+inAsia = sessBox(asOn, asSess, asCol, "Asia")
+inLon  = sessBox(loOn, loSess, loCol, "London")
+inNY   = sessBox(nyOn, nySess, nyCol, "New York")

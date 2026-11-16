@@ -1,0 +1,280 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MSNR Multi-Timeframe Levels (Malaysian Support & Resistance)
+//
+//  A-Level : bullish candle followed by a bearish candle  → level at the close of
+//            the bullish candle (peak of the line chart)   → resistance
+//  V-Level : bearish candle followed by a bullish candle  → level at the close of
+//            the bearish candle (valley of the line chart) → support
+//
+//  Fresh   : no wick has touched the level since it formed  (solid line)
+//  Unfresh : a wick touched the level                        (dashed line)
+//  Broken  : a candle BODY closed through the level          (deleted / dotted)
+//
+//  Levels are detected on up to 3 higher timeframes using confirmed candles only
+//  (no repainting) and printed with their exact price on the chart.
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("MSNR Multi-Timeframe Levels", shorttitle = "MSNR MTF", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+grpTF  = "Timeframes"
+tf1On  = input.bool(true,  "",        inline = "tf1", group = grpTF)
+tf1    = input.timeframe("D",   "TF 1", inline = "tf1", group = grpTF)
+tf1Col = input.color(#e91e63, "",     inline = "tf1", group = grpTF)
+tf2On  = input.bool(true,  "",        inline = "tf2", group = grpTF)
+tf2    = input.timeframe("240", "TF 2", inline = "tf2", group = grpTF)
+tf2Col = input.color(#ff9800, "",     inline = "tf2", group = grpTF)
+tf3On  = input.bool(true,  "",        inline = "tf3", group = grpTF)
+tf3    = input.timeframe("60",  "TF 3", inline = "tf3", group = grpTF)
+tf3Col = input.color(#2196f3, "",     inline = "tf3", group = grpTF)
+
+grpL        = "Levels"
+maxPerTf    = input.int(6, "Max active levels per timeframe", minval = 1, maxval = 50, group = grpL)
+showUnfresh = input.bool(true, "Show unfresh (wick-touched) levels", group = grpL)
+brokenMode  = input.string("Delete", "Broken levels", options = ["Delete", "Keep (dotted)"], group = grpL)
+colorMode   = input.string("Timeframe", "Color levels by", options = ["Timeframe", "Type (A/V)"], group = grpL)
+aCol        = input.color(#f23645, "A-Level color", inline = "typ", group = grpL)
+vCol        = input.color(#089981, "V-Level color", inline = "typ", group = grpL)
+lineWidth   = input.int(2, "Line width", minval = 1, maxval = 4, group = grpL)
+
+grpLb       = "Price Labels"
+showLabels  = input.bool(true, "Show price labels", group = grpLb)
+labelOffset = input.int(10, "Label offset (bars to the right)", minval = 0, maxval = 200, group = grpLb)
+labelSizeIn = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = grpLb)
+
+grpD     = "Dashboard"
+showDash = input.bool(true, "Show dashboard", group = grpD)
+dashPosIn = input.string("Top Right", "Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpD)
+
+grpA       = "Alerts"
+alertTouch = input.bool(true, "Alert when a fresh level is touched", group = grpA)
+alertBreak = input.bool(true, "Alert when a level is broken",        group = grpA)
+
+lblSize = labelSizeIn == "Tiny" ? size.tiny : labelSizeIn == "Normal" ? size.normal : size.small
+dashPos = dashPosIn == "Top Left" ? position.top_left : dashPosIn == "Bottom Right" ? position.bottom_right :
+     dashPosIn == "Bottom Left" ? position.bottom_left : position.top_right
+
+// ─── TYPES & STATE ────────────────────────────────────────────────────────────
+type Lvl
+    float  price
+    bool   isA
+    int    tfIdx
+    string tfName
+    int    state   // 0 = fresh, 1 = unfresh, 2 = broken
+    int    born    // chart bar_index at detection
+    line   ln
+    label  lb
+
+var array<Lvl> levels = array.new<Lvl>()
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+tfText(string tf) =>
+    sec = timeframe.in_seconds(tf)
+    sec >= 2592000 ? str.tostring(sec / 2592000, "#") + "M" :
+     sec >= 604800 ? str.tostring(sec / 604800,  "#") + "W" :
+     sec >= 86400  ? str.tostring(sec / 86400,   "#") + "D" :
+     sec >= 3600   ? str.tostring(sec / 3600,    "#.#") + "H" :
+     str.tostring(sec / 60, "#") + "m"
+
+tfAllowed(string tf) =>
+    timeframe.in_seconds(tf) >= timeframe.in_seconds(timeframe.period)
+
+tfColor(int idx) =>
+    idx == 1 ? tf1Col : idx == 2 ? tf2Col : tf3Col
+
+levelColor(Lvl l) =>
+    colorMode == "Timeframe" ? tfColor(l.tfIdx) : l.isA ? aCol : vCol
+
+levelText(Lvl l) =>
+    tag = l.state == 0 ? "" : l.state == 1 ? " (U)" : " (X)"
+    l.tfName + " " + (l.isA ? "A" : "V") + tag + "  " + str.tostring(l.price, format.mintick)
+
+applyStyle(Lvl l) =>
+    c = levelColor(l)
+    if l.state == 0
+        l.ln.set_color(c)
+        l.ln.set_style(line.style_solid)
+    else if l.state == 1
+        l.ln.set_color(color.new(c, 45))
+        l.ln.set_style(line.style_dashed)
+    else
+        l.ln.set_color(color.new(color.gray, 40))
+        l.ln.set_style(line.style_dotted)
+        l.ln.set_extend(extend.none)
+        l.ln.set_x2(time)
+    if not na(l.lb)
+        l.lb.set_text(levelText(l))
+        l.lb.set_color(l.state == 0 ? color.new(c, 15) : color.new(c, 55))
+
+fmtDist(float p) =>
+    na(p) ? "-" : str.tostring(math.abs(p - close), format.mintick) + "  (" +
+         str.tostring(math.abs(p - close) / syminfo.mintick, "#") + " ticks)"
+
+removeAt(int i) =>
+    l = levels.get(i)
+    line.delete(l.ln)
+    label.delete(l.lb)
+    levels.remove(i)
+
+addLevel(float price, bool isA, int tfIdx, string tfName, int t0) =>
+    // skip duplicates of the same timeframe & price
+    dup = false
+    for l in levels
+        if l.tfIdx == tfIdx and l.state < 2 and l.price == price
+            dup := true
+    if not dup
+        lv = Lvl.new(price, isA, tfIdx, tfName, 0, bar_index, na, na)
+        c  = levelColor(lv)
+        lv.ln := line.new(t0, price, time, price, xloc = xloc.bar_time, extend = extend.right,
+             color = c, width = lineWidth, style = line.style_solid)
+        if showLabels
+            lv.lb := label.new(time, price, levelText(lv), xloc = xloc.bar_time,
+                 style = label.style_label_left, color = color.new(c, 15),
+                 textcolor = color.white, size = lblSize)
+        levels.push(lv)
+        // keep only the newest `maxPerTf` active levels of this timeframe
+        cnt = 0
+        for i = levels.size() - 1 to 0
+            l = levels.get(i)
+            if l.tfIdx == tfIdx and l.state < 2
+                cnt += 1
+                if cnt > maxPerTf
+                    removeAt(i)
+        // global safety cap for drawing limits
+        while levels.size() > 450
+            removeAt(0)
+
+// ─── HTF DETECTION (confirmed candles only → no repaint) ──────────────────────
+msnr() =>
+    isA = close[2] > open[2] and close[1] < open[1]
+    isV = close[2] < open[2] and close[1] > open[1]
+    [isA, isV, close[2], time[2], time]
+
+[a1, v1, p1, t1, n1] = request.security(syminfo.tickerid, tf1, msnr(), lookahead = barmerge.lookahead_on)
+[a2, v2, p2, t2, n2] = request.security(syminfo.tickerid, tf2, msnr(), lookahead = barmerge.lookahead_on)
+[a3, v3, p3, t3, n3] = request.security(syminfo.tickerid, tf3, msnr(), lookahead = barmerge.lookahead_on)
+
+ch1 = ta.change(n1)
+ch2 = ta.change(n2)
+ch3 = ta.change(n3)
+new1 = tf1On and tfAllowed(tf1) and ch1 != 0
+new2 = tf2On and tfAllowed(tf2) and ch2 != 0
+new3 = tf3On and tfAllowed(tf3) and ch3 != 0
+
+if new1 and (a1 or v1)
+    addLevel(p1, a1, 1, tfText(tf1), t1)
+if new2 and (a2 or v2)
+    addLevel(p2, a2, 2, tfText(tf2), t2)
+if new3 and (a3 or v3)
+    addLevel(p3, a3, 3, tfText(tf3), t3)
+
+// ─── FRESH / UNFRESH / BROKEN TRACKING ────────────────────────────────────────
+touchedNow = false
+brokenNow  = false
+touchMsg   = ""
+breakMsg   = ""
+
+if barstate.isconfirmed and levels.size() > 0
+    for i = levels.size() - 1 to 0
+        l = levels.get(i)
+        if l.state == 2 or bar_index <= l.born
+            continue
+        isBroken  = l.isA ? close > l.price : close < l.price
+        isTouched = l.isA ? high >= l.price : low <= l.price
+        if isBroken
+            brokenNow := true
+            breakMsg  := breakMsg + levelText(l) + " broken\n"
+            if brokenMode == "Delete"
+                removeAt(i)
+            else
+                l.state := 2
+                label.delete(l.lb)
+                l.lb := na
+                applyStyle(l)
+        else if isTouched and l.state == 0
+            touchedNow := true
+            touchMsg   := touchMsg + levelText(l) + " touched\n"
+            l.state := 1
+            if showUnfresh
+                applyStyle(l)
+            else
+                removeAt(i)
+
+if alertTouch and touchedNow
+    alert(syminfo.ticker + " MSNR: " + touchMsg, alert.freq_once_per_bar_close)
+if alertBreak and brokenNow
+    alert(syminfo.ticker + " MSNR: " + breakMsg, alert.freq_once_per_bar_close)
+
+// ─── LABEL POSITION (keep price labels to the right of price) ────────────────
+if barstate.islast and showLabels
+    xOff = time + labelOffset * timeframe.in_seconds() * 1000
+    for l in levels
+        if not na(l.lb)
+            l.lb.set_x(xOff)
+
+// ─── DASHBOARD: nearest levels with digital distance ─────────────────────────
+var table dash = table.new(dashPos, 4, 7, bgcolor = color.new(color.black, 80),
+     border_color = color.new(color.white, 70), border_width = 1)
+
+if showDash and barstate.islast
+    float resP = na
+    float supP = na
+    string resT = "-"
+    string supT = "-"
+    int fr1 = 0
+    int fr2 = 0
+    int fr3 = 0
+    int un1 = 0
+    int un2 = 0
+    int un3 = 0
+    for l in levels
+        if l.state < 2
+            if l.price > close and (na(resP) or l.price < resP)
+                resP := l.price
+                resT := l.tfName + " " + (l.isA ? "A" : "V") + (l.state == 1 ? " (U)" : "")
+            if l.price < close and (na(supP) or l.price > supP)
+                supP := l.price
+                supT := l.tfName + " " + (l.isA ? "A" : "V") + (l.state == 1 ? " (U)" : "")
+            if l.tfIdx == 1
+                fr1 += l.state == 0 ? 1 : 0
+                un1 += l.state == 1 ? 1 : 0
+            else if l.tfIdx == 2
+                fr2 += l.state == 0 ? 1 : 0
+                un2 += l.state == 1 ? 1 : 0
+            else
+                fr3 += l.state == 0 ? 1 : 0
+                un3 += l.state == 1 ? 1 : 0
+
+    txt = color.white
+    hdr = color.silver
+    table.cell(dash, 0, 0, "MSNR",       text_color = hdr, text_size = size.small)
+    table.cell(dash, 1, 0, "Level",      text_color = hdr, text_size = size.small)
+    table.cell(dash, 2, 0, "Price",      text_color = hdr, text_size = size.small)
+    table.cell(dash, 3, 0, "Distance",   text_color = hdr, text_size = size.small)
+
+    table.cell(dash, 0, 1, "Resistance", text_color = aCol, text_size = size.small)
+    table.cell(dash, 1, 1, resT,         text_color = txt,  text_size = size.small)
+    table.cell(dash, 2, 1, na(resP) ? "-" : str.tostring(resP, format.mintick), text_color = txt, text_size = size.small)
+    table.cell(dash, 3, 1, fmtDist(resP), text_color = txt, text_size = size.small)
+
+    table.cell(dash, 0, 2, "Price",      text_color = hdr, text_size = size.small)
+    table.cell(dash, 1, 2, "",           text_color = txt, text_size = size.small)
+    table.cell(dash, 2, 2, str.tostring(close, format.mintick), text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 3, 2, "",           text_color = txt, text_size = size.small)
+
+    table.cell(dash, 0, 3, "Support",    text_color = vCol, text_size = size.small)
+    table.cell(dash, 1, 3, supT,         text_color = txt,  text_size = size.small)
+    table.cell(dash, 2, 3, na(supP) ? "-" : str.tostring(supP, format.mintick), text_color = txt, text_size = size.small)
+    table.cell(dash, 3, 3, fmtDist(supP), text_color = txt, text_size = size.small)
+
+    table.cell(dash, 0, 4, tfText(tf1),  text_color = tf1Col, text_size = size.small)
+    table.cell(dash, 1, 4, tf1On and tfAllowed(tf1) ? "Fresh " + str.tostring(fr1) + " / Unfresh " + str.tostring(un1) : "off",
+         text_color = txt, text_size = size.small)
+    table.cell(dash, 0, 5, tfText(tf2),  text_color = tf2Col, text_size = size.small)
+    table.cell(dash, 1, 5, tf2On and tfAllowed(tf2) ? "Fresh " + str.tostring(fr2) + " / Unfresh " + str.tostring(un2) : "off",
+         text_color = txt, text_size = size.small)
+    table.cell(dash, 0, 6, tfText(tf3),  text_color = tf3Col, text_size = size.small)
+    table.cell(dash, 1, 6, tf3On and tfAllowed(tf3) ? "Fresh " + str.tostring(fr3) + " / Unfresh " + str.tostring(un3) : "off",
+         text_color = txt, text_size = size.small)

@@ -1,0 +1,342 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Pre-NY H1 Sweep + MSS + FVG  (backtestable strategy)
+//
+//  1. Range   : high / low of the Pre-NY hour (default 08:00–09:00 New York time)
+//  2. Sweep   : price trades beyond the range high (short setup) or low (long setup)
+//  3. MSS     : a candle closes beyond the last internal swing that preceded the sweep
+//  4. FVG     : the displacement leaves a Fair Value Gap → limit order in the FVG
+//  5. Stop    : beyond the sweep extreme (+ ATR buffer)
+//  6. Target  : opposite side of the range (optional 50% partial at mid-range) or fixed R:R
+//
+//  Options  : HTF EMA bias filter, MSNR confluence (sweep must hit an HTF A/V level),
+//             risk-based position sizing, one trade per day, flat at end of day.
+//  Use on a chart timeframe below 1H (1m – 15m).
+// ═══════════════════════════════════════════════════════════════════════════════
+strategy("Pre-NY H1 Sweep + MSS + FVG", shorttitle = "PreNY Sweep", overlay = true,
+     initial_capital   = 10000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.02,
+     slippage          = 2,
+     pyramiding        = 0,
+     max_boxes_count   = 500,
+     max_lines_count   = 500,
+     max_labels_count  = 500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+grpT      = "Time (New York)"
+tz        = input.string("America/New_York", "Timezone", group = grpT)
+rangeSess = input.session("0800-0900", "Pre-NY range (H1)", group = grpT)
+tradeSess = input.session("0900-1200", "Entry window",       group = grpT)
+holdSess  = input.session("0800-1600", "Flat outside (EOD)", group = grpT)
+
+grpS      = "Setup"
+pvLen     = input.int(2, "MSS swing length", minval = 1, maxval = 10, group = grpS)
+entryMode = input.string("FVG edge", "Entry in FVG", options = ["FVG edge", "FVG 50%"], group = grpS)
+minFvgAtr = input.float(0.05, "Min FVG size (× ATR)", minval = 0, step = 0.05, group = grpS)
+allowLong = input.bool(true, "Allow longs",  group = grpS)
+allowShrt = input.bool(true, "Allow shorts", group = grpS)
+maxTrades = input.int(1, "Max trades per day", minval = 1, maxval = 4, group = grpS)
+
+grpR      = "Risk & Exits"
+riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, step = 0.1, group = grpR)
+slBufAtr  = input.float(0.1, "SL buffer beyond sweep (× ATR)", minval = 0, step = 0.05, group = grpR)
+tpMode    = input.string("50% partial + opposite", "Target",
+     options = ["Range opposite", "50% partial + opposite", "Fixed R:R"], group = grpR)
+rrFixed   = input.float(3.0, "Fixed R:R", minval = 0.5, step = 0.1, group = grpR)
+minRR     = input.float(1.5, "Minimum R:R to take the trade", minval = 0.5, step = 0.1, group = grpR)
+
+grpF      = "Filters"
+biasMode  = input.string("None", "HTF bias", options = ["None", "HTF EMA"], group = grpF)
+biasTf    = input.timeframe("240", "Bias timeframe", group = grpF)
+biasLen   = input.int(50, "Bias EMA length", group = grpF)
+useMsnr   = input.bool(false, "Require MSNR confluence at the sweep", group = grpF)
+msnrTf    = input.timeframe("240", "MSNR timeframe", group = grpF)
+msnrTol   = input.float(0.5, "MSNR tolerance (× ATR)", minval = 0, step = 0.1, group = grpF)
+
+grpV      = "Visuals"
+showDash  = input.bool(true, "Show results table", group = grpV)
+
+if timeframe.in_seconds() >= 3600
+    runtime.error("Use a chart timeframe below 1H (e.g. 1m, 5m or 15m).")
+
+// ─── COMMON SERIES ────────────────────────────────────────────────────────────
+atr     = ta.atr(14)
+inRange = not na(time(timeframe.period, rangeSess, tz))
+inTrade = not na(time(timeframe.period, tradeSess, tz))
+inHold  = not na(time(timeframe.period, holdSess,  tz))
+rStart  = inRange and not inRange[1]
+rEnd    = not inRange and inRange[1]
+
+pH = ta.pivothigh(high, pvLen, pvLen)
+pL = ta.pivotlow(low,  pvLen, pvLen)
+var float lastPH = na
+var float lastPL = na
+
+bearFvg = high < low[2]  and (low[2] - high) >= atr * minFvgAtr
+bullFvg = low  > high[2] and (low - high[2]) >= atr * minFvgAtr
+
+// HTF bias (confirmed HTF bar only)
+htfEma   = request.security(syminfo.tickerid, biasTf, ta.ema(close, biasLen)[1], lookahead = barmerge.lookahead_on)
+htfClose = request.security(syminfo.tickerid, biasTf, close[1],                   lookahead = barmerge.lookahead_on)
+biasShortOK = biasMode == "None" or htfClose < htfEma
+biasLongOK  = biasMode == "None" or htfClose > htfEma
+
+// MSNR A/V levels from the HTF (for confluence)
+msnr() =>
+    isA = close[2] > open[2] and close[1] < open[1]
+    isV = close[2] < open[2] and close[1] > open[1]
+    [isA, isV, close[2], time]
+[mA, mV, mP, mT] = request.security(syminfo.tickerid, msnrTf, msnr(), lookahead = barmerge.lookahead_on)
+var array<float> aLv = array.new<float>()
+var array<float> vLv = array.new<float>()
+mNew = ta.change(mT) != 0
+if mNew and mA
+    aLv.push(mP)
+    if aLv.size() > 30
+        aLv.shift()
+if mNew and mV
+    vLv.push(mP)
+    if vLv.size() > 30
+        vLv.shift()
+
+levelBetween(array<float> arr, float lo, float hi) =>
+    found = false
+    for p in arr
+        if p >= lo and p <= hi
+            found := true
+    found
+
+calcQty(float entry, float sl) =>
+    risk = math.abs(entry - sl)
+    risk > 0 ? (strategy.equity * riskPct / 100) / (risk * syminfo.pointvalue) : 0.0
+
+// ─── DAILY STATE ──────────────────────────────────────────────────────────────
+var float rHi    = na
+var float rLo    = na
+var bool  rReady = false
+var int   trades = 0
+
+// short side
+var bool  sSwept = false
+var float sExt   = na
+var int   sBar   = na
+var float sMss   = na
+var bool  sMssOk = false
+var float sTop   = na
+var float sBot   = na
+var int   sFBar  = na
+var bool  sPlaced = false
+var float sSL    = na
+var float sTP    = na
+
+// long side
+var bool  lSwept = false
+var float lExt   = na
+var int   lBar   = na
+var float lMss   = na
+var bool  lMssOk = false
+var float lTop   = na
+var float lBot   = na
+var int   lFBar  = na
+var bool  lPlaced = false
+var float lSL    = na
+var float lTP    = na
+
+if rStart
+    rHi := high
+    rLo := low
+    rReady := false
+    trades := 0
+    sSwept := false
+    sExt := na
+    sBar := na
+    sMss := na
+    sMssOk := false
+    sTop := na
+    sBot := na
+    sFBar := na
+    sPlaced := false
+    sSL := na
+    sTP := na
+    lSwept := false
+    lExt := na
+    lBar := na
+    lMss := na
+    lMssOk := false
+    lTop := na
+    lBot := na
+    lFBar := na
+    lPlaced := false
+    lSL := na
+    lTP := na
+    strategy.cancel("Short")
+    strategy.cancel("Long")
+else if inRange
+    rHi := math.max(rHi, high)
+    rLo := math.min(rLo, low)
+if rEnd
+    rReady := true
+    box.new(bar_index - 1, rHi, bar_index + 1, rLo, border_color = color.new(color.gray, 50),
+         bgcolor = color.new(color.gray, 90), text = "PRE-NY", text_size = size.tiny,
+         text_color = color.gray, text_valign = text.align_top)
+
+// count fills & cancel the opposite pending order
+posOpened = strategy.position_size != 0 and strategy.position_size[1] == 0
+if posOpened
+    trades += 1
+if strategy.position_size < 0
+    strategy.cancel("Long")
+if strategy.position_size > 0
+    strategy.cancel("Short")
+
+// ─── SETUP DETECTION ──────────────────────────────────────────────────────────
+active = rReady and inTrade and trades < maxTrades
+
+if active and barstate.isconfirmed
+    // ── SHORT: sweep of the range high ──
+    if allowShrt and not sPlaced
+        if not sSwept and high > rHi
+            sSwept := true
+            sExt   := high
+            sBar   := bar_index
+            sMss   := lastPL
+        else if sSwept and not sMssOk
+            sExt := math.max(sExt, high)
+        // a pivot low that formed before the sweep but confirmed after it
+        if sSwept and not sMssOk and not na(pL) and bar_index - pvLen <= sBar
+            sMss := pL
+        if sSwept and bearFvg and bar_index - 1 >= sBar
+            sTop  := low[2]
+            sBot  := high
+            sFBar := bar_index - 1
+        if sSwept and not sMssOk and not na(sMss) and close < sMss
+            sMssOk := true
+            line.new(sBar, sMss, bar_index, sMss, color = color.new(color.red, 20), style = line.style_dashed)
+            label.new(bar_index, sMss, "MSS", style = label.style_label_up, color = color.new(color.red, 100),
+                 textcolor = color.red, size = size.tiny)
+
+        confl = not useMsnr or levelBetween(aLv, rHi - atr * msnrTol, sExt + atr * msnrTol)
+        if sMssOk and not na(sTop) and strategy.position_size == 0 and biasShortOK and confl
+            entry = entryMode == "FVG edge" ? sBot : (sTop + sBot) / 2
+            sl    = sExt + atr * slBufAtr
+            tp    = tpMode == "Fixed R:R" ? entry - (sl - entry) * rrFixed : rLo
+            rr    = sl > entry ? (entry - tp) / (sl - entry) : 0.0
+            if close < entry and tp < entry and rr >= minRR
+                qty = calcQty(entry, sl)
+                if qty > 0
+                    strategy.entry("Short", strategy.short, qty = qty, limit = entry, comment = "S FVG")
+                    mid = (rHi + rLo) / 2
+                    if tpMode == "50% partial + opposite" and mid < entry and mid > tp
+                        strategy.exit("S TP1", "Short", qty_percent = 50, limit = mid, stop = sl)
+                        strategy.exit("S TP2", "Short", limit = tp, stop = sl)
+                    else
+                        strategy.exit("S X", "Short", limit = tp, stop = sl)
+                    sPlaced := true
+                    sSL := sl
+                    sTP := tp
+                    box.new(sFBar, sTop, bar_index + 5, sBot, border_color = color.new(color.red, 40),
+                         bgcolor = color.new(color.red, 80), text = "FVG", text_size = size.tiny,
+                         text_color = color.red)
+
+    // ── LONG: sweep of the range low ──
+    if allowLong and not lPlaced
+        if not lSwept and low < rLo
+            lSwept := true
+            lExt   := low
+            lBar   := bar_index
+            lMss   := lastPH
+        else if lSwept and not lMssOk
+            lExt := math.min(lExt, low)
+        if lSwept and not lMssOk and not na(pH) and bar_index - pvLen <= lBar
+            lMss := pH
+        if lSwept and bullFvg and bar_index - 1 >= lBar
+            lTop  := low
+            lBot  := high[2]
+            lFBar := bar_index - 1
+        if lSwept and not lMssOk and not na(lMss) and close > lMss
+            lMssOk := true
+            line.new(lBar, lMss, bar_index, lMss, color = color.new(color.green, 20), style = line.style_dashed)
+            label.new(bar_index, lMss, "MSS", style = label.style_label_down, color = color.new(color.green, 100),
+                 textcolor = color.green, size = size.tiny)
+
+        confl = not useMsnr or levelBetween(vLv, lExt - atr * msnrTol, rLo + atr * msnrTol)
+        if lMssOk and not na(lTop) and strategy.position_size == 0 and biasLongOK and confl
+            entry = entryMode == "FVG edge" ? lTop : (lTop + lBot) / 2
+            sl    = lExt - atr * slBufAtr
+            tp    = tpMode == "Fixed R:R" ? entry + (entry - sl) * rrFixed : rHi
+            rr    = entry > sl ? (tp - entry) / (entry - sl) : 0.0
+            if close > entry and tp > entry and rr >= minRR
+                qty = calcQty(entry, sl)
+                if qty > 0
+                    strategy.entry("Long", strategy.long, qty = qty, limit = entry, comment = "B FVG")
+                    mid = (rHi + rLo) / 2
+                    if tpMode == "50% partial + opposite" and mid > entry and mid < tp
+                        strategy.exit("L TP1", "Long", qty_percent = 50, limit = mid, stop = sl)
+                        strategy.exit("L TP2", "Long", limit = tp, stop = sl)
+                    else
+                        strategy.exit("L X", "Long", limit = tp, stop = sl)
+                    lPlaced := true
+                    lSL := sl
+                    lTP := tp
+                    box.new(lFBar, lTop, bar_index + 5, lBot, border_color = color.new(color.green, 40),
+                         bgcolor = color.new(color.green, 80), text = "FVG", text_size = size.tiny,
+                         text_color = color.green)
+
+// update swing memory after it has been used for this bar
+if not na(pH)
+    lastPH := pH
+if not na(pL)
+    lastPL := pL
+
+// ─── PENDING ORDER INVALIDATION ───────────────────────────────────────────────
+if strategy.position_size == 0
+    // target reached or sweep extreme exceeded before the fill → setup is dead
+    if sPlaced and (low <= sTP or high >= sSL)
+        strategy.cancel("Short")
+    if lPlaced and (high >= lTP or low <= lSL)
+        strategy.cancel("Long")
+    if not inTrade
+        strategy.cancel("Short")
+        strategy.cancel("Long")
+
+// flat at end of day
+if strategy.position_size != 0 and not inHold
+    strategy.close_all(comment = "EOD")
+
+// ─── VISUALS ──────────────────────────────────────────────────────────────────
+showLv = rReady and inHold
+plot(showLv ? rHi : na, "Pre-NY High", color = color.new(color.gray, 20), style = plot.style_linebr)
+plot(showLv ? rLo : na, "Pre-NY Low",  color = color.new(color.gray, 20), style = plot.style_linebr)
+plot(showLv ? (rHi + rLo) / 2 : na, "Mid", color = color.new(color.gray, 60), style = plot.style_linebr)
+bgcolor(inRange ? color.new(color.gray, 92) : inTrade ? color.new(color.blue, 96) : na, title = "Sessions")
+
+var table dash = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 80),
+     border_color = color.new(color.white, 70), border_width = 1)
+
+if showDash and barstate.islast
+    tot = strategy.closedtrades
+    wr  = tot > 0 ? strategy.wintrades * 100.0 / tot : 0.0
+    pf  = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    np  = strategy.netprofit
+    npp = np / strategy.initial_capital * 100
+    ddp = strategy.max_drawdown / strategy.initial_capital * 100
+    w = color.white
+    table.cell(dash, 0, 0, "Pre-NY Sweep", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.silver, text_size = size.small)
+    table.cell(dash, 0, 1, "Trades",        text_color = w, text_size = size.small)
+    table.cell(dash, 1, 1, str.tostring(tot), text_color = w, text_size = size.small)
+    table.cell(dash, 0, 2, "Win rate",      text_color = w, text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(wr, "#.#") + " %", text_color = wr >= 50 ? color.lime : color.orange, text_size = size.small)
+    table.cell(dash, 0, 3, "Net profit",    text_color = w, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(np, "#.##") + "  (" + str.tostring(npp, "#.#") + " %)",
+         text_color = np >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(dash, 0, 4, "Profit factor", text_color = w, text_size = size.small)
+    table.cell(dash, 1, 4, na(pf) ? "-" : str.tostring(pf, "#.##"), text_color = w, text_size = size.small)
+    table.cell(dash, 0, 5, "Max drawdown",  text_color = w, text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(ddp, "#.#") + " %", text_color = color.orange, text_size = size.small)
+    table.cell(dash, 0, 6, "Today",         text_color = w, text_size = size.small)
+    table.cell(dash, 1, 6, rReady ? "H " + str.tostring(rHi, format.mintick) + " / L " + str.tostring(rLo, format.mintick) : "building range",
+         text_color = w, text_size = size.small)

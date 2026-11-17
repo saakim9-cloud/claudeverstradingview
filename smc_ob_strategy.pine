@@ -1,0 +1,241 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SMC Classic — BOS / CHoCH + Order Block (backtestable strategy)
+//
+//  Structure : swing highs / lows (pivots) on the chart timeframe
+//  BOS       : candle CLOSES beyond the last swing in the trend direction
+//  CHoCH     : first close beyond the last swing AGAINST the current trend
+//  Order Block (bullish break): last bearish candle at the origin of the impulse
+//                               (the lowest point of the leg that broke structure)
+//  Entry     : limit order at the OB proximal edge on the retracement
+//  Stop      : beyond the OB distal edge (+ ATR buffer)
+//  Target    : fixed R:R
+//
+//  No time filter by default (pure SMC) so it can be compared with the ICT model.
+//  Same risk sizing / commissions / results table as the other repo strategies.
+// ═══════════════════════════════════════════════════════════════════════════════
+strategy("SMC Classic - BOS/CHoCH + Order Block", shorttitle = "SMC OB", overlay = true,
+     initial_capital   = 10000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.02,
+     slippage          = 2,
+     pyramiding        = 0,
+     max_bars_back     = 500,
+     max_boxes_count   = 500,
+     max_lines_count   = 500,
+     max_labels_count  = 500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+grpS      = "Structure"
+swLen     = input.int(5, "Swing length", minval = 2, maxval = 30, group = grpS)
+sigMode   = input.string("BOS + CHoCH", "Trade on", options = ["BOS + CHoCH", "BOS only", "CHoCH only"], group = grpS)
+obMode    = input.string("Wick", "Order block range", options = ["Wick", "Body"], group = grpS)
+needFvg   = input.bool(false, "Require FVG in the impulse (displacement)", group = grpS)
+maxLook   = input.int(150, "Max lookback for the impulse (bars)", minval = 20, maxval = 400, group = grpS)
+maxPend   = input.int(40, "Cancel pending order after (bars)", minval = 5, maxval = 300, group = grpS)
+allowLong = input.bool(true, "Allow longs",  group = grpS)
+allowShrt = input.bool(true, "Allow shorts", group = grpS)
+
+grpR      = "Risk & Exits"
+riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, step = 0.1, group = grpR)
+slBufAtr  = input.float(0.1, "SL buffer beyond OB (× ATR)", minval = 0, step = 0.05, group = grpR)
+rr        = input.float(2.5, "Target R:R", minval = 0.5, step = 0.1, group = grpR)
+
+grpF      = "Optional filters"
+useSess   = input.bool(false, "Session filter", group = grpF)
+sessTz    = input.string("America/New_York", "Timezone", group = grpF)
+sess1     = input.session("0300-0600", "Session 1 (London)", group = grpF)
+sess2     = input.session("0830-1130", "Session 2 (New York)", group = grpF)
+biasMode  = input.string("None", "HTF bias", options = ["None", "HTF EMA"], group = grpF)
+biasTf    = input.timeframe("240", "Bias timeframe", group = grpF)
+biasLen   = input.int(50, "Bias EMA length", group = grpF)
+
+grpV      = "Visuals"
+showStruct = input.bool(true, "Show BOS / CHoCH", group = grpV)
+showDash   = input.bool(true, "Show results table", group = grpV)
+
+// ─── COMMON SERIES ────────────────────────────────────────────────────────────
+atr   = ta.atr(14)
+inSes = not useSess or not na(time(timeframe.period, sess1, sessTz)) or not na(time(timeframe.period, sess2, sessTz))
+
+htfEma   = request.security(syminfo.tickerid, biasTf, ta.ema(close, biasLen)[1], lookahead = barmerge.lookahead_on)
+htfClose = request.security(syminfo.tickerid, biasTf, close[1],                   lookahead = barmerge.lookahead_on)
+biasLongOK  = biasMode == "None" or htfClose > htfEma
+biasShortOK = biasMode == "None" or htfClose < htfEma
+
+calcQty(float entry, float sl) =>
+    risk = math.abs(entry - sl)
+    risk > 0 ? (strategy.equity * riskPct / 100) / (risk * syminfo.pointvalue) : 0.0
+
+// ─── SWINGS & STRUCTURE ───────────────────────────────────────────────────────
+ph = ta.pivothigh(high, swLen, swLen)
+pl = ta.pivotlow(low,  swLen, swLen)
+
+var float shP = na
+var int   shB = na
+var bool  shBroken = true
+var float slP = na
+var int   slB = na
+var bool  slBroken = true
+var int   trend = 0      // 1 bullish, -1 bearish
+
+if not na(ph)
+    shP := ph
+    shB := bar_index - swLen
+    shBroken := false
+if not na(pl)
+    slP := pl
+    slB := bar_index - swLen
+    slBroken := false
+
+bullBreak = barstate.isconfirmed and not shBroken and close > shP
+bearBreak = barstate.isconfirmed and not slBroken and close < slP
+
+// pending order state
+var int   pendDir = 0
+var int   pendBar = na
+var float pendSL  = na
+
+// ─── BULLISH BREAK → bullish OB ───────────────────────────────────────────────
+if bullBreak
+    isChoch = trend == -1
+    trend := 1
+    shBroken := true
+    if showStruct
+        line.new(shB, shP, bar_index, shP, color = color.new(color.green, 30), style = line.style_dashed)
+        label.new(math.round((shB + bar_index) / 2), shP, isChoch ? "CHoCH" : "BOS",
+             style = label.style_label_down, color = color.new(color.green, 100), textcolor = color.green, size = size.tiny)
+    if pendDir == -1
+        strategy.cancel("Short")
+        pendDir := 0
+
+    // origin of the impulse = lowest low since the broken swing high
+    span = math.min(bar_index - shB, maxLook)
+    oOff = 0
+    oVal = low
+    for i = 0 to span
+        if low[i] < oVal
+            oVal := low[i]
+            oOff := i
+    // OB = last bearish candle at / before the origin
+    int obOff = na
+    for i = oOff to math.min(oOff + 10, maxLook)
+        if close[i] < open[i]
+            obOff := i
+            break
+    // displacement check: bullish FVG inside the impulse
+    hasFvg = false
+    if needFvg and oOff >= 2
+        for i = 0 to oOff - 2
+            if low[i] > high[i + 2]
+                hasFvg := true
+
+    wanted = sigMode == "BOS + CHoCH" or (sigMode == "BOS only" and not isChoch) or (sigMode == "CHoCH only" and isChoch)
+    if not na(obOff) and wanted and allowLong and biasLongOK and inSes and (not needFvg or hasFvg) and strategy.position_size == 0
+        obTop = obMode == "Wick" ? high[obOff] : math.max(open[obOff], close[obOff])
+        obBot = obMode == "Wick" ? low[obOff]  : math.min(open[obOff], close[obOff])
+        entry = obTop
+        sl    = obBot - atr * slBufAtr
+        risk  = entry - sl
+        if close > entry and risk > 0
+            qty = calcQty(entry, sl)
+            if qty > 0
+                strategy.cancel("Long")
+                strategy.entry("Long", strategy.long, qty = qty, limit = entry, comment = isChoch ? "B CHoCH" : "B BOS")
+                strategy.exit("L X", "Long", stop = sl, limit = entry + risk * rr)
+                pendDir := 1
+                pendBar := bar_index
+                pendSL  := sl
+                box.new(bar_index - obOff, obTop, bar_index + 10, obBot, border_color = color.new(color.green, 40),
+                     bgcolor = color.new(color.green, 82), text = "OB", text_size = size.tiny, text_color = color.green)
+
+// ─── BEARISH BREAK → bearish OB ───────────────────────────────────────────────
+if bearBreak
+    isChoch = trend == 1
+    trend := -1
+    slBroken := true
+    if showStruct
+        line.new(slB, slP, bar_index, slP, color = color.new(color.red, 30), style = line.style_dashed)
+        label.new(math.round((slB + bar_index) / 2), slP, isChoch ? "CHoCH" : "BOS",
+             style = label.style_label_up, color = color.new(color.red, 100), textcolor = color.red, size = size.tiny)
+    if pendDir == 1
+        strategy.cancel("Long")
+        pendDir := 0
+
+    span = math.min(bar_index - slB, maxLook)
+    oOff = 0
+    oVal = high
+    for i = 0 to span
+        if high[i] > oVal
+            oVal := high[i]
+            oOff := i
+    int obOff = na
+    for i = oOff to math.min(oOff + 10, maxLook)
+        if close[i] > open[i]
+            obOff := i
+            break
+    hasFvg = false
+    if needFvg and oOff >= 2
+        for i = 0 to oOff - 2
+            if high[i] < low[i + 2]
+                hasFvg := true
+
+    wanted = sigMode == "BOS + CHoCH" or (sigMode == "BOS only" and not isChoch) or (sigMode == "CHoCH only" and isChoch)
+    if not na(obOff) and wanted and allowShrt and biasShortOK and inSes and (not needFvg or hasFvg) and strategy.position_size == 0
+        obTop = obMode == "Wick" ? high[obOff] : math.max(open[obOff], close[obOff])
+        obBot = obMode == "Wick" ? low[obOff]  : math.min(open[obOff], close[obOff])
+        entry = obBot
+        sl    = obTop + atr * slBufAtr
+        risk  = sl - entry
+        if close < entry and risk > 0
+            qty = calcQty(entry, sl)
+            if qty > 0
+                strategy.cancel("Short")
+                strategy.entry("Short", strategy.short, qty = qty, limit = entry, comment = isChoch ? "S CHoCH" : "S BOS")
+                strategy.exit("S X", "Short", stop = sl, limit = entry - risk * rr)
+                pendDir := -1
+                pendBar := bar_index
+                pendSL  := sl
+                box.new(bar_index - obOff, obTop, bar_index + 10, obBot, border_color = color.new(color.red, 40),
+                     bgcolor = color.new(color.red, 82), text = "OB", text_size = size.tiny, text_color = color.red)
+
+// ─── PENDING ORDER MANAGEMENT ─────────────────────────────────────────────────
+if strategy.position_size != 0
+    pendDir := 0
+else if pendDir != 0
+    expired = bar_index - pendBar > maxPend
+    invalid = pendDir == 1 ? close < pendSL : close > pendSL
+    if expired or invalid or (useSess and not inSes)
+        strategy.cancel(pendDir == 1 ? "Long" : "Short")
+        pendDir := 0
+
+// ─── RESULTS TABLE ────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 80),
+     border_color = color.new(color.white, 70), border_width = 1)
+
+if showDash and barstate.islast
+    tot = strategy.closedtrades
+    wr  = tot > 0 ? strategy.wintrades * 100.0 / tot : 0.0
+    pf  = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    np  = strategy.netprofit
+    npp = np / strategy.initial_capital * 100
+    ddp = strategy.max_drawdown / strategy.initial_capital * 100
+    w = color.white
+    table.cell(dash, 0, 0, "SMC OB", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.silver, text_size = size.small)
+    table.cell(dash, 0, 1, "Trades",        text_color = w, text_size = size.small)
+    table.cell(dash, 1, 1, str.tostring(tot), text_color = w, text_size = size.small)
+    table.cell(dash, 0, 2, "Win rate",      text_color = w, text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(wr, "#.#") + " %", text_color = wr >= 50 ? color.lime : color.orange, text_size = size.small)
+    table.cell(dash, 0, 3, "Net profit",    text_color = w, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(np, "#.##") + "  (" + str.tostring(npp, "#.#") + " %)",
+         text_color = np >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(dash, 0, 4, "Profit factor", text_color = w, text_size = size.small)
+    table.cell(dash, 1, 4, na(pf) ? "-" : str.tostring(pf, "#.##"), text_color = w, text_size = size.small)
+    table.cell(dash, 0, 5, "Max drawdown",  text_color = w, text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(ddp, "#.#") + " %", text_color = color.orange, text_size = size.small)
+    table.cell(dash, 0, 6, "Trend",         text_color = w, text_size = size.small)
+    table.cell(dash, 1, 6, trend == 1 ? "Bullish" : trend == -1 ? "Bearish" : "-",
+         text_color = trend == 1 ? color.lime : trend == -1 ? color.red : w, text_size = size.small)

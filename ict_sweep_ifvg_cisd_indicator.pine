@@ -2,7 +2,7 @@
 // ICT model: Liquidity Sweep → HTF Delivery → iFVG (1m) → CISD
 // Built for 1m charts (XAUUSD, BTC, ETH). Times are New York time.
 indicator(
-     title            = "ICT Sweep → iFVG + CISD Indicateur (25-11-2026)",
+     title            = "ICT Sweep → iFVG + CISD Indicateur + DXY (25-11-2026)",
      shorttitle       = "ICT iFVG CISD",
      overlay          = true,
      max_boxes_count  = 300,
@@ -57,6 +57,14 @@ rrFixed = input.float(2.0, "RR fixe", minval=0.5, step=0.25, group=G_RISK)
 minRR   = input.float(2.0, "RR minimum (mode liquidité)", minval=0.5, step=0.25, group=G_RISK)
 atrLen  = input.int(14, "ATR", minval=1, group=G_RISK)
 
+G_DXY     = "7. Filtre DXY"
+useDxy    = input.bool(true, "Activer le filtre DXY", group=G_DXY)
+dxySym    = input.symbol("TVC:DXY", "Symbole DXY", group=G_DXY)
+dxyTF     = input.timeframe("60", "Timeframe DXY", group=G_DXY)
+dxyPivLen = input.int(5, "Longueur swing support/résistance", minval=2, group=G_DXY)
+dxyMaxAge = input.int(24, "Cassure valide pendant N bougies DXY (0 = illimité)", minval=0, group=G_DXY)
+showDxy   = input.bool(true, "Afficher le statut DXY", group=G_DXY)
+
 // ─── COMMON ───────────────────────────────────────────────────────────────────
 TZ  = "America/New_York"
 atr = ta.atr(atrLen)
@@ -73,6 +81,42 @@ bgcolor(showKZ and (inLon or inNYAM or inNYPM) ? color.new(color.gray, 92) : na,
 [htfC, htfE] = request.security(syminfo.tickerid, biasTF, [close[1], ta.ema(close, biasLen)[1]], lookahead=barmerge.lookahead_on)
 biasBull = biasMode == "Désactivé" or htfC > htfE
 biasBear = biasMode == "Désactivé" or htfC < htfE
+
+// ─── 7. DXY FILTER ────────────────────────────────────────────────────────────
+// State on confirmed DXY candles: -1 = closed below last swing-low support (gold bullish)
+//                                 +1 = closed above last swing-high resistance (gold bearish)
+dxyState() =>
+    dph = ta.pivothigh(high, dxyPivLen, dxyPivLen)
+    dpl = ta.pivotlow(low, dxyPivLen, dxyPivLen)
+    var float res = na
+    var float sup = na
+    var int   st  = 0
+    var int   brk = na
+    if not na(dph)
+        res := dph
+    if not na(dpl)
+        sup := dpl
+    if not na(sup) and close < sup
+        st  := -1
+        brk := bar_index
+        sup := na
+    if not na(res) and close > res
+        st  := 1
+        brk := bar_index
+        res := na
+    [st[1], bar_index[1] - brk[1]]
+
+[dxySt, dxyAge] = request.security(dxySym, dxyTF, dxyState(), lookahead=barmerge.lookahead_on)
+dxyFresh   = dxyMaxAge == 0 or (not na(dxyAge) and dxyAge <= dxyMaxAge)
+dxyBullOk  = not useDxy or (dxySt == -1 and dxyFresh)
+dxyBearOk  = not useDxy or (dxySt == 1 and dxyFresh)
+
+var table dxyTbl = table.new(position.top_right, 1, 1)
+if showDxy and useDxy and barstate.islast
+    txt = dxySt == -1 ? "DXY " + dxyTF + " : support cassé ↓ → BUY or" : dxySt == 1 ? "DXY " + dxyTF + " : résistance cassée ↑ → SELL or" : "DXY " + dxyTF + " : neutre"
+    txt := txt + (dxySt != 0 and not dxyFresh ? " (expiré)" : "")
+    bg  = not dxyFresh or dxySt == 0 ? color.new(color.gray, 30) : dxySt == -1 ? color.new(color.green, 20) : color.new(color.red, 20)
+    table.cell(dxyTbl, 0, 0, txt, text_color=color.white, bgcolor=bg, text_size=size.small)
 
 // ─── 3. LIQUIDITY LEVELS ──────────────────────────────────────────────────────
 var float[] liqHighs = array.new_float()
@@ -399,12 +443,12 @@ if not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)
     risk  = entry - sl
     liqTp = nearestAbove(liqHighs, entry)
     tp    = tpMode == "RR fixe" ? entry + risk * rrFixed : (not na(liqTp) and (liqTp - entry) >= minRR * risk ? liqTp : na)
-    if flat and inKillzone and biasBull and bullDel and risk > 0 and not na(tp)
+    if flat and inKillzone and biasBull and bullDel and dxyBullOk and risk > 0 and not na(tp)
         longSignal := true
         tradeDir := 1
         tradeSL  := sl
         tradeTP  := tp
-        label.new(bar_index, low, "BUY\n" + str.tostring(entry, format.mintick), style=label.style_label_up, yloc=yloc.belowbar, color=color.new(color.green, 0), textcolor=color.white, size=size.normal)
+        label.new(bar_index, low, "BUY\n" + str.tostring(entry, format.mintick) + (useDxy ? "\nDXY ✔" : ""), style=label.style_label_up, yloc=yloc.belowbar, color=color.new(color.green, 0), textcolor=color.white, size=size.normal)
         line.new(bar_index, tp, bar_index + 15, tp, color=color.green, width=2)
         line.new(bar_index, sl, bar_index + 15, sl, color=color.red, width=2)
         alert("ICT BUY " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
@@ -419,12 +463,12 @@ if not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)
     risk  = sl - entry
     liqTp = nearestBelow(liqLows, entry)
     tp    = tpMode == "RR fixe" ? entry - risk * rrFixed : (not na(liqTp) and (entry - liqTp) >= minRR * risk ? liqTp : na)
-    if flat and inKillzone and biasBear and bearDel and risk > 0 and not na(tp)
+    if flat and inKillzone and biasBear and bearDel and dxyBearOk and risk > 0 and not na(tp)
         shortSignal := true
         tradeDir := -1
         tradeSL  := sl
         tradeTP  := tp
-        label.new(bar_index, high, "SELL\n" + str.tostring(entry, format.mintick), style=label.style_label_down, yloc=yloc.abovebar, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
+        label.new(bar_index, high, "SELL\n" + str.tostring(entry, format.mintick) + (useDxy ? "\nDXY ✔" : ""), style=label.style_label_down, yloc=yloc.abovebar, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
         line.new(bar_index, tp, bar_index + 15, tp, color=color.green, width=2)
         line.new(bar_index, sl, bar_index + 15, sl, color=color.red, width=2)
         alert("ICT SELL " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)

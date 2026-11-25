@@ -2,7 +2,7 @@
 // ICT model: Liquidity Sweep → HTF Delivery → iFVG (1m) → CISD
 // Built for 1m charts (XAUUSD, BTC, ETH). Times are New York time.
 strategy(
-     title                   = "ICT Sweep → iFVG + CISD",
+     title                   = "ICT Sweep → iFVG + CISD (25-11-2026)",
      shorttitle              = "ICT iFVG CISD",
      overlay                 = true,
      default_qty_type        = strategy.percent_of_equity,

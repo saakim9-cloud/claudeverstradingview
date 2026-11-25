@@ -404,9 +404,10 @@ if not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)
         tradeDir := 1
         tradeSL  := sl
         tradeTP  := tp
+        label.new(bar_index, low, "BUY\n" + str.tostring(entry, format.mintick), style=label.style_label_up, yloc=yloc.belowbar, color=color.new(color.green, 0), textcolor=color.white, size=size.normal)
         line.new(bar_index, tp, bar_index + 15, tp, color=color.green, width=2)
         line.new(bar_index, sl, bar_index + 15, sl, color=color.red, width=2)
-        alert("ICT LONG " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
+        alert("ICT BUY " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
     // One shot per sweep
     bullBar := na
 
@@ -423,9 +424,10 @@ if not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)
         tradeDir := -1
         tradeSL  := sl
         tradeTP  := tp
+        label.new(bar_index, high, "SELL\n" + str.tostring(entry, format.mintick), style=label.style_label_down, yloc=yloc.abovebar, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
         line.new(bar_index, tp, bar_index + 15, tp, color=color.green, width=2)
         line.new(bar_index, sl, bar_index + 15, sl, color=color.red, width=2)
-        alert("ICT SHORT " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
+        alert("ICT SELL " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
     bearBar := na
 
 // Expire stale sweeps
@@ -434,8 +436,6 @@ if not na(bullBar) and bar_index - bullBar > sweepWin
 if not na(bearBar) and bar_index - bearBar > sweepWin
     bearBar := na
 
-plotshape(longSignal,  "Long",  shape.triangleup,   location.belowbar, color.green, size=size.small)
-plotshape(shortSignal, "Short", shape.triangledown, location.abovebar, color.red,   size=size.small)
 
-alertcondition(longSignal,  "ICT Long",  "ICT LONG {{ticker}} @ {{close}}")
-alertcondition(shortSignal, "ICT Short", "ICT SHORT {{ticker}} @ {{close}}")
+alertcondition(longSignal,  "ICT BUY",  "ICT BUY {{ticker}} @ {{close}}")
+alertcondition(shortSignal, "ICT SELL", "ICT SELL {{ticker}} @ {{close}}")

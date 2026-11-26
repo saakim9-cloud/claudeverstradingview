@@ -530,11 +530,61 @@ nearestBelow(float[] arr, float p) =>
                 r := v
     r
 
-flat = strategy.position_size == 0
+var bool bullPend = false
+var bool bearPend = false
+useLimit = not isIC and entryMode == "Retest du FVG"
+flat = strategy.position_size == 0 and not bullPend and not bearPend
+
+// ─── LIMIT ORDER IN THE FVG (CHoCH + FVG, retest mode) ────────────────────────
+// Pending order management (fill / invalidation / expiry)
+if bullPend
+    if strategy.position_size > 0
+        bullPend := false
+        bullBar  := na
+    else if na(bullBar) or na(bullChochBar) or na(bullFvgB) or close < bullFvgB or bar_index - bullChochBar > retestWin
+        strategy.cancel("Long")
+        bullPend := false
+        bullBar  := na
+if bearPend
+    if strategy.position_size < 0
+        bearPend := false
+        bearBar  := na
+    else if na(bearBar) or na(bearChochBar) or na(bearFvgT) or close > bearFvgT or bar_index - bearChochBar > retestWin
+        strategy.cancel("Short")
+        bearPend := false
+        bearBar  := na
+
+// Place the limit order on the CHoCH candle
+if useLimit and flat and not na(bullBar) and bar_index == bullChochBar and not na(bullFvgT)
+    lim   = bullFvgT
+    sl    = bullExt - slBuf * atr
+    risk  = lim - sl
+    liqTp = nearestAbove(liqHighs, lim)
+    tp    = tpMode == "RR fixe" ? lim + risk * rrFixed : (not na(liqTp) and (liqTp - lim) >= minRR * risk ? liqTp : na)
+    if inKillzone and biasBull and bullDel and dxyBullOk and risk > 0 and not na(tp)
+        strategy.entry("Long", strategy.long, limit=lim)
+        strategy.exit("XL", "Long", stop=sl, limit=tp)
+        bullPend := true
+        label.new(bar_index, low, "BUY LIMIT\n" + str.tostring(lim, format.mintick), style=label.style_label_up, yloc=yloc.belowbar, color=#00C853, textcolor=color.white, size=size.normal)
+        line.new(bar_index, tp, bar_index + 15, tp, color=#00E676, width=2)
+        line.new(bar_index, sl, bar_index + 15, sl, color=#FF5252, width=2)
+if useLimit and flat and not bullPend and not na(bearBar) and bar_index == bearChochBar and not na(bearFvgB)
+    lim   = bearFvgB
+    sl    = bearExt + slBuf * atr
+    risk  = sl - lim
+    liqTp = nearestBelow(liqLows, lim)
+    tp    = tpMode == "RR fixe" ? lim - risk * rrFixed : (not na(liqTp) and (lim - liqTp) >= minRR * risk ? liqTp : na)
+    if inKillzone and biasBear and bearDel and dxyBearOk and risk > 0 and not na(tp)
+        strategy.entry("Short", strategy.short, limit=lim)
+        strategy.exit("XS", "Short", stop=sl, limit=tp)
+        bearPend := true
+        label.new(bar_index, high, "SELL LIMIT\n" + str.tostring(lim, format.mintick), style=label.style_label_down, yloc=yloc.abovebar, color=#D50000, textcolor=color.white, size=size.normal)
+        line.new(bar_index, tp, bar_index + 15, tp, color=#00E676, width=2)
+        line.new(bar_index, sl, bar_index + 15, sl, color=#FF5252, width=2)
 
 // Long
 longSignal = false
-bullTrig = isIC ? (not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)) : bullChTrig
+bullTrig = isIC ? (not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)) : (useLimit ? false : bullChTrig)
 if bullTrig
     entry = close
     sl    = bullExt - slBuf * atr
@@ -554,7 +604,7 @@ if bullTrig
 
 // Short
 shortSignal = false
-bearTrig = isIC ? (not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)) : bearChTrig
+bearTrig = isIC ? (not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)) : (useLimit ? false : bearChTrig)
 if bearTrig
     entry = close
     sl    = bearExt + slBuf * atr
@@ -574,9 +624,9 @@ if bearTrig
 // Expire stale sweeps
 bullRef = not isIC and not na(bullChochBar) ? bullChochBar : bullBar
 bullLim = not isIC and not na(bullChochBar) ? retestWin : sweepWin
-if not na(bullBar) and bar_index - bullRef > bullLim
+if not na(bullBar) and not bullPend and bar_index - bullRef > bullLim
     bullBar := na
 bearRef = not isIC and not na(bearChochBar) ? bearChochBar : bearBar
 bearLim = not isIC and not na(bearChochBar) ? retestWin : sweepWin
-if not na(bearBar) and bar_index - bearRef > bearLim
+if not na(bearBar) and not bearPend and bar_index - bearRef > bearLim
     bearBar := na

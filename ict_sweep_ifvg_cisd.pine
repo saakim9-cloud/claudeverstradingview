@@ -1,10 +1,11 @@
 //@version=5
-// ICT model: Liquidity Sweep → HTF Delivery → iFVG (1m) → CISD
+// ICT model: Liquidity Sweep → HTF Delivery → CHoCH + FVG retest (or iFVG + CISD) on 1m
 // Built for 1m charts (XAUUSD, BTC, ETH). Times are New York time.
 strategy(
-     title                   = "ICT Sweep → iFVG + CISD (25-11-2026)",
-     shorttitle              = "ICT iFVG CISD",
+     title                   = "ICT Sweep → CHoCH/FVG ou iFVG/CISD + DXY (Stratégie)",
+     shorttitle              = "ICT Strat",
      overlay                 = true,
+     initial_capital         = 10000,
      default_qty_type        = strategy.percent_of_equity,
      default_qty_value       = 5,
      commission_type         = strategy.commission.percent,
@@ -16,13 +17,22 @@ strategy(
      max_labels_count        = 300)
 
 // ─── INPUTS ───────────────────────────────────────────────────────────────────
-G_KZ   = "1. Killzones (heure NY)"
-useKZ  = input.bool(true, "Filtrer par killzone", group=G_KZ)
-kzLon  = input.session("0200-0500", "London", group=G_KZ)
-kzNYAM = input.session("0700-1000", "NY AM", group=G_KZ)
-useNYPM= input.bool(false, "Inclure NY PM", inline="pm", group=G_KZ)
-kzNYPM = input.session("1330-1600", "", inline="pm", group=G_KZ)
-showKZ = input.bool(true, "Colorer les killzones", group=G_KZ)
+G_KZ    = "1. Sessions (heure NY)"
+sAsia   = input.session("2000-0000", "Asia", inline="as", group=G_KZ)
+cAsia   = input.color(color.new(#7E57C2, 85), "", inline="as", group=G_KZ)
+tAsia   = input.bool(false, "Signaux", inline="as", group=G_KZ)
+kzLon   = input.session("0200-0500", "London", inline="lo", group=G_KZ)
+cLon    = input.color(color.new(#2962FF, 85), "", inline="lo", group=G_KZ)
+tLon    = input.bool(true, "Signaux", inline="lo", group=G_KZ)
+kzNYAM  = input.session("0700-1000", "NY AM", inline="am", group=G_KZ)
+cNYAM   = input.color(color.new(#FF9800, 87), "", inline="am", group=G_KZ)
+tNYAM   = input.bool(true, "Signaux", inline="am", group=G_KZ)
+kzNYPM  = input.session("1330-1600", "NY PM", inline="pm", group=G_KZ)
+cNYPM   = input.color(color.new(#26A69A, 87), "", inline="pm", group=G_KZ)
+tNYPM   = input.bool(true, "Signaux", inline="pm", group=G_KZ)
+useKZ   = input.bool(true, "Signaux seulement dans les sessions cochées", group=G_KZ)
+showKZ  = input.bool(true, "Colorer les sessions", group=G_KZ)
+showKZL = input.bool(true, "Afficher le nom des sessions", group=G_KZ)
 
 G_BIAS   = "2. Biais HTF"
 biasMode = input.string("EMA HTF", "Biais", options=["EMA HTF", "Désactivé"], group=G_BIAS)
@@ -31,8 +41,7 @@ biasLen  = input.int(50, "Longueur EMA", minval=1, group=G_BIAS)
 
 G_LIQ      = "3. Liquidité"
 usePD      = input.bool(true, "PDH / PDL", group=G_LIQ)
-useAsia    = input.bool(true, "Asia High / Low", inline="asia", group=G_LIQ)
-asiaSess   = input.session("2000-0000", "", inline="asia", group=G_LIQ)
+useAsia    = input.bool(true, "Asia High / Low", group=G_LIQ)
 usePivots  = input.bool(true, "Swing highs / lows", inline="piv", group=G_LIQ)
 pivLen     = input.int(15, "longueur", minval=2, inline="piv", group=G_LIQ)
 maxLevels  = input.int(12, "Niveaux max gardés (par côté)", minval=1, group=G_LIQ)
@@ -49,6 +58,10 @@ rangeLen  = input.int(20, "Barres du dealing range", minval=2, group=G_DEL)
 showHtfFvg= input.bool(true, "Afficher les FVG HTF", group=G_DEL)
 
 G_CONF    = "5. Confirmation 1m"
+confMode  = input.string("CHoCH + FVG", "Modèle de confirmation", options=["CHoCH + FVG", "iFVG + CISD"], group=G_CONF)
+chochLen  = input.int(3, "Swing pour le CHoCH (longueur)", minval=1, group=G_CONF)
+entryMode = input.string("Retest du FVG", "Entrée (CHoCH + FVG)", options=["Retest du FVG", "Clôture du CHoCH"], group=G_CONF)
+retestWin = input.int(30, "Barres max pour le retest du FVG", minval=1, group=G_CONF)
 reqIfvg   = input.bool(true, "Exiger iFVG", group=G_CONF)
 reqCisd   = input.bool(true, "Exiger CISD", group=G_CONF)
 minFvgAtr = input.float(0.25, "Taille min FVG (x ATR)", minval=0, step=0.05, group=G_CONF)
@@ -63,22 +76,81 @@ rrFixed = input.float(2.0, "RR fixe", minval=0.5, step=0.25, group=G_RISK)
 minRR   = input.float(2.0, "RR minimum (mode liquidité)", minval=0.5, step=0.25, group=G_RISK)
 atrLen  = input.int(14, "ATR", minval=1, group=G_RISK)
 
+G_DXY     = "7. Filtre DXY"
+useDxy    = input.bool(true, "Activer le filtre DXY", group=G_DXY)
+dxySym    = input.symbol("TVC:DXY", "Symbole DXY", group=G_DXY)
+dxyTF     = input.timeframe("60", "Timeframe DXY", group=G_DXY)
+dxyPivLen = input.int(5, "Longueur swing support/résistance", minval=2, group=G_DXY)
+dxyMaxAge = input.int(24, "Cassure valide pendant N bougies DXY (0 = illimité)", minval=0, group=G_DXY)
+showDxy   = input.bool(true, "Afficher le statut DXY", group=G_DXY)
+
+isIC = confMode == "iFVG + CISD"
+
 // ─── COMMON ───────────────────────────────────────────────────────────────────
 TZ  = "America/New_York"
 atr = ta.atr(atrLen)
 
 inSess(s) => not na(time(timeframe.period, s, TZ))
 
+inAsia     = inSess(sAsia)
 inLon      = inSess(kzLon)
 inNYAM     = inSess(kzNYAM)
-inNYPM     = useNYPM and inSess(kzNYPM)
-inKillzone = not useKZ or inLon or inNYAM or inNYPM
-bgcolor(showKZ and (inLon or inNYAM or inNYPM) ? color.new(color.gray, 92) : na, title="Killzone")
+inNYPM     = inSess(kzNYPM)
+inKillzone = not useKZ or (tAsia and inAsia) or (tLon and inLon) or (tNYAM and inNYAM) or (tNYPM and inNYPM)
+
+sessCol = inAsia ? cAsia : inLon ? cLon : inNYAM ? cNYAM : inNYPM ? cNYPM : na
+bgcolor(showKZ ? sessCol : na, title="Sessions")
+
+sessName(bool startNow, string txt, color col) =>
+    if showKZL and startNow
+        label.new(bar_index, high, txt, yloc=yloc.abovebar, style=label.style_none, textcolor=color.new(col, 0), size=size.small)
+    0
+
+sessName(inAsia and not inAsia[1], "ASIA", cAsia)
+sessName(inLon and not inLon[1], "LONDON", cLon)
+sessName(inNYAM and not inNYAM[1], "NY AM", cNYAM)
+sessName(inNYPM and not inNYPM[1], "NY PM", cNYPM)
 
 // ─── 2. BIAS ──────────────────────────────────────────────────────────────────
 [htfC, htfE] = request.security(syminfo.tickerid, biasTF, [close[1], ta.ema(close, biasLen)[1]], lookahead=barmerge.lookahead_on)
 biasBull = biasMode == "Désactivé" or htfC > htfE
 biasBear = biasMode == "Désactivé" or htfC < htfE
+
+// ─── 7. DXY FILTER ────────────────────────────────────────────────────────────
+// State on confirmed DXY candles: -1 = closed below last swing-low support (gold bullish)
+//                                 +1 = closed above last swing-high resistance (gold bearish)
+dxyState() =>
+    dph = ta.pivothigh(high, dxyPivLen, dxyPivLen)
+    dpl = ta.pivotlow(low, dxyPivLen, dxyPivLen)
+    var float res = na
+    var float sup = na
+    var int   st  = 0
+    var int   brk = na
+    if not na(dph)
+        res := dph
+    if not na(dpl)
+        sup := dpl
+    if not na(sup) and close < sup
+        st  := -1
+        brk := bar_index
+        sup := na
+    if not na(res) and close > res
+        st  := 1
+        brk := bar_index
+        res := na
+    [st[1], bar_index[1] - brk[1]]
+
+[dxySt, dxyAge] = request.security(dxySym, dxyTF, dxyState(), lookahead=barmerge.lookahead_on)
+dxyFresh   = dxyMaxAge == 0 or (not na(dxyAge) and dxyAge <= dxyMaxAge)
+dxyBullOk  = not useDxy or (dxySt == -1 and dxyFresh)
+dxyBearOk  = not useDxy or (dxySt == 1 and dxyFresh)
+
+var table dxyTbl = table.new(position.top_right, 1, 1)
+if showDxy and useDxy and barstate.islast
+    txt = dxySt == -1 ? "DXY " + dxyTF + " : support cassé ↓ → BUY or" : dxySt == 1 ? "DXY " + dxyTF + " : résistance cassée ↑ → SELL or" : "DXY " + dxyTF + " : neutre"
+    txt := txt + (dxySt != 0 and not dxyFresh ? " (expiré)" : "")
+    bg  = not dxyFresh or dxySt == 0 ? #424242 : dxySt == -1 ? #00C853 : #D50000
+    table.cell(dxyTbl, 0, 0, txt, text_color=color.white, bgcolor=bg, text_size=size.small)
 
 // ─── 3. LIQUIDITY LEVELS ──────────────────────────────────────────────────────
 var float[] liqHighs = array.new_float()
@@ -99,7 +171,6 @@ if usePD and pdl != pdl[1]
     addLevel(liqLows, pdl)
 
 // Asia range
-inAsia = inSess(asiaSess)
 var float asiaH = na
 var float asiaL = na
 if inAsia and not inAsia[1]
@@ -120,10 +191,10 @@ if usePivots and not na(ph)
 if usePivots and not na(pl)
     addLevel(liqLows, pl)
 
-plot(showLiq and usePD ? pdh : na, "PDH", color.new(color.orange, 30), 1, plot.style_stepline)
-plot(showLiq and usePD ? pdl : na, "PDL", color.new(color.orange, 30), 1, plot.style_stepline)
-plot(showLiq and useAsia and not inAsia ? asiaH : na, "Asia High", color.new(color.purple, 40), 1, plot.style_linebr)
-plot(showLiq and useAsia and not inAsia ? asiaL : na, "Asia Low", color.new(color.purple, 40), 1, plot.style_linebr)
+plot(showLiq and usePD ? pdh : na, "PDH", color.new(#FFEB3B, 10), 1, plot.style_stepline)
+plot(showLiq and usePD ? pdl : na, "PDL", color.new(#FFEB3B, 10), 1, plot.style_stepline)
+plot(showLiq and useAsia and not inAsia ? asiaH : na, "Asia High", color.new(#B388FF, 10), 1, plot.style_linebr)
+plot(showLiq and useAsia and not inAsia ? asiaL : na, "Asia Low", color.new(#B388FF, 10), 1, plot.style_linebr)
 
 // ─── 4. HTF DELIVERY ──────────────────────────────────────────────────────────
 // HTF FVGs from confirmed HTF candles (non-repainting)
@@ -149,9 +220,9 @@ pushHtfFvg(float[] tops, float[] bots, box[] boxes, float top, float bot, color 
     0
 
 if newHtfBar and hL1 > hH3
-    pushHtfFvg(hBullTop, hBullBot, hBullBox, hL1, hH3, color.new(color.teal, 85))
+    pushHtfFvg(hBullTop, hBullBot, hBullBox, hL1, hH3, color.new(#00E676, 88))
 if newHtfBar and hH1 < hL3
-    pushHtfFvg(hBearTop, hBearBot, hBearBox, hL3, hH1, color.new(color.red, 85))
+    pushHtfFvg(hBearTop, hBearBot, hBearBox, hL3, hH1, color.new(#FF5252, 88))
 
 inHtfBullFvg(float p) =>
     bool r = false
@@ -231,7 +302,25 @@ if array.size(liqHighs) > 0
                 bearSweepNow := true
             array.remove(liqHighs, i)
 
+// Internal swings (CHoCH reference)
+iph = ta.pivothigh(high, chochLen, chochLen)
+ipl = ta.pivotlow(low, chochLen, chochLen)
+var float lastSwH = na
+var float lastSwL = na
+if not na(iph)
+    lastSwH := iph
+if not na(ipl)
+    lastSwL := ipl
+
 // Sweep state
+var float bullChoch    = na
+var int   bullChochBar = na
+var float bullFvgT     = na
+var float bullFvgB     = na
+var float bearChoch    = na
+var int   bearChochBar = na
+var float bearFvgT     = na
+var float bearFvgB     = na
 var float bullExt  = na
 var int   bullBar  = na
 var bool  bullDel  = false
@@ -248,23 +337,33 @@ var int   bearCisdBar = na
 
 if bullSweepNow or (not na(bullBar) and low < bullExt)
     if bullSweepNow and na(bullBar)
-        label.new(bar_index, low, "SSL", style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+        label.new(bar_index, low, "SSL", style=label.style_label_up, color=color.new(#00C853, 0), textcolor=color.white, size=size.tiny)
     bullBar     := bullSweepNow or na(bullBar) ? bar_index : bullBar
     bullExt     := low
     bullDel     := deliveryBull(low)
     bullCisd    := cisdLevelBull()
     bullIfvgBar := na
     bullCisdBar := na
+    if bullSweepNow
+        bullChoch := lastSwH
+    bullChochBar := na
+    bullFvgT     := na
+    bullFvgB     := na
 
 if bearSweepNow or (not na(bearBar) and high > bearExt)
     if bearSweepNow and na(bearBar)
-        label.new(bar_index, high, "BSL", style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+        label.new(bar_index, high, "BSL", style=label.style_label_down, color=color.new(#D50000, 0), textcolor=color.white, size=size.tiny)
     bearBar     := bearSweepNow or na(bearBar) ? bar_index : bearBar
     bearExt     := high
     bearDel     := deliveryBear(high)
     bearCisd    := cisdLevelBear()
     bearIfvgBar := na
     bearCisdBar := na
+    if bearSweepNow
+        bearChoch := lastSwL
+    bearChochBar := na
+    bearFvgT     := na
+    bearFvgB     := na
 
 // HTF FVG invalidation (after delivery check) + extend boxes
 if array.size(hBullTop) > 0
@@ -314,7 +413,8 @@ if array.size(bearFTop) > 0
         else if close > top
             if not na(bullBar) and fb >= bullBar - preSweep and na(bullIfvgBar)
                 bullIfvgBar := bar_index
-                box.new(fb, top, bar_index, array.get(bearFBot, i), border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 80), text="iFVG", text_size=size.tiny, text_color=color.green)
+                if isIC
+                    box.new(fb, top, bar_index, array.get(bearFBot, i), border_color=color.new(#00E676, 20), bgcolor=color.new(#00E676, 80), text="iFVG", text_size=size.tiny, text_color=#00E676)
             array.remove(bearFTop, i)
             array.remove(bearFBot, i)
             array.remove(bearFBar, i)
@@ -331,20 +431,73 @@ if array.size(bullFTop) > 0
         else if close < bot
             if not na(bearBar) and fb >= bearBar - preSweep and na(bearIfvgBar)
                 bearIfvgBar := bar_index
-                box.new(fb, array.get(bullFTop, i), bar_index, bot, border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 80), text="iFVG", text_size=size.tiny, text_color=color.red)
+                if isIC
+                    box.new(fb, array.get(bullFTop, i), bar_index, bot, border_color=color.new(#FF5252, 20), bgcolor=color.new(#FF5252, 80), text="iFVG", text_size=size.tiny, text_color=#FF5252)
             array.remove(bullFTop, i)
             array.remove(bullFBot, i)
             array.remove(bullFBar, i)
 
 // ─── 5b. CISD ─────────────────────────────────────────────────────────────────
-if not na(bullBar) and na(bullCisdBar) and not na(bullCisd) and close > bullCisd
+if isIC and not na(bullBar) and na(bullCisdBar) and not na(bullCisd) and close > bullCisd
     bullCisdBar := bar_index
-    line.new(bullBar, bullCisd, bar_index, bullCisd, color=color.green, style=line.style_dashed)
-    label.new(bar_index, bullCisd, "CISD", style=label.style_label_left, color=color.new(color.green, 100), textcolor=color.green, size=size.tiny)
-if not na(bearBar) and na(bearCisdBar) and not na(bearCisd) and close < bearCisd
+    line.new(bullBar, bullCisd, bar_index, bullCisd, color=#00E676, style=line.style_dashed)
+    label.new(bar_index, bullCisd, "CISD", style=label.style_label_left, color=color.new(#00E676, 100), textcolor=#00E676, size=size.tiny)
+if isIC and not na(bearBar) and na(bearCisdBar) and not na(bearCisd) and close < bearCisd
     bearCisdBar := bar_index
-    line.new(bearBar, bearCisd, bar_index, bearCisd, color=color.red, style=line.style_dashed)
-    label.new(bar_index, bearCisd, "CISD", style=label.style_label_left, color=color.new(color.red, 100), textcolor=color.red, size=size.tiny)
+    line.new(bearBar, bearCisd, bar_index, bearCisd, color=#FF5252, style=line.style_dashed)
+    label.new(bar_index, bearCisd, "CISD", style=label.style_label_left, color=color.new(#FF5252, 100), textcolor=#FF5252, size=size.tiny)
+
+// ─── 5c. CHoCH + FVG ──────────────────────────────────────────────────────────
+// FVG left by the displacement leg after the sweep (up to the CHoCH candle)
+if not isIC and not na(bullBar) and na(bullChochBar) and low > high[2] and (low - high[2]) >= minFvgAtr * atr and bar_index - 1 >= bullBar
+    bullFvgT := low
+    bullFvgB := high[2]
+if not isIC and not na(bearBar) and na(bearChochBar) and high < low[2] and (low[2] - high) >= minFvgAtr * atr and bar_index - 1 >= bearBar
+    bearFvgT := low[2]
+    bearFvgB := high
+
+// CHoCH: close beyond the last internal swing before the sweep
+if not isIC and not na(bullBar) and na(bullChochBar) and not na(bullChoch) and close > bullChoch
+    bullChochBar := bar_index
+    line.new(bullBar, bullChoch, bar_index, bullChoch, color=#00E676, width=1)
+    label.new(bar_index, bullChoch, "CHoCH", style=label.style_label_left, color=color.new(#00E676, 100), textcolor=#00E676, size=size.tiny)
+    if not na(bullFvgT)
+        box.new(bar_index, bullFvgT, bar_index + 10, bullFvgB, border_color=color.new(#00E676, 20), bgcolor=color.new(#00E676, 80), text="FVG", text_size=size.tiny, text_color=#00E676)
+if not isIC and not na(bearBar) and na(bearChochBar) and not na(bearChoch) and close < bearChoch
+    bearChochBar := bar_index
+    line.new(bearBar, bearChoch, bar_index, bearChoch, color=#FF5252, width=1)
+    label.new(bar_index, bearChoch, "CHoCH", style=label.style_label_left, color=color.new(#FF5252, 100), textcolor=#FF5252, size=size.tiny)
+    if not na(bearFvgT)
+        box.new(bar_index, bearFvgT, bar_index + 10, bearFvgB, border_color=color.new(#FF5252, 20), bgcolor=color.new(#FF5252, 80), text="FVG", text_size=size.tiny, text_color=#FF5252)
+
+// Entry trigger: retest of the FVG (or CHoCH close in aggressive mode)
+bullChTrig  = false
+bullChEntry = float(na)
+if not isIC and not na(bullBar) and not na(bullChochBar) and not na(bullFvgT)
+    if entryMode == "Clôture du CHoCH"
+        if bar_index == bullChochBar
+            bullChTrig  := true
+            bullChEntry := close
+    else if bar_index > bullChochBar
+        if close < bullFvgB
+            bullBar := na
+        else if low <= bullFvgT
+            bullChTrig  := true
+            bullChEntry := math.min(open, bullFvgT)
+
+bearChTrig  = false
+bearChEntry = float(na)
+if not isIC and not na(bearBar) and not na(bearChochBar) and not na(bearFvgT)
+    if entryMode == "Clôture du CHoCH"
+        if bar_index == bearChochBar
+            bearChTrig  := true
+            bearChEntry := close
+    else if bar_index > bearChochBar
+        if close > bearFvgT
+            bearBar := na
+        else if high >= bearFvgB
+            bearChTrig  := true
+            bearChEntry := math.max(open, bearFvgB)
 
 // ─── SETUP EVALUATION ─────────────────────────────────────────────────────────
 confirmed(int ifvgBar, int cisdBar) =>
@@ -381,44 +534,49 @@ flat = strategy.position_size == 0
 
 // Long
 longSignal = false
-if not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)
+bullTrig = isIC ? (not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)) : bullChTrig
+if bullTrig
     entry = close
     sl    = bullExt - slBuf * atr
     risk  = entry - sl
     liqTp = nearestAbove(liqHighs, entry)
     tp    = tpMode == "RR fixe" ? entry + risk * rrFixed : (not na(liqTp) and (liqTp - entry) >= minRR * risk ? liqTp : na)
-    if flat and inKillzone and biasBull and bullDel and risk > 0 and not na(tp)
+    if flat and inKillzone and biasBull and bullDel and dxyBullOk and risk > 0 and not na(tp)
         longSignal := true
         strategy.entry("Long", strategy.long)
         strategy.exit("XL", "Long", stop=sl, limit=tp)
-        line.new(bar_index, tp, bar_index + 15, tp, color=color.green, width=2)
-        line.new(bar_index, sl, bar_index + 15, sl, color=color.red, width=2)
-        alert("ICT LONG " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
+        label.new(bar_index, low, "BUY\n" + str.tostring(entry, format.mintick) + (useDxy ? "\nDXY ✔" : ""), style=label.style_label_up, yloc=yloc.belowbar, color=#00C853, textcolor=color.white, size=size.normal)
+        line.new(bar_index, tp, bar_index + 15, tp, color=#00E676, width=2)
+        line.new(bar_index, sl, bar_index + 15, sl, color=#FF5252, width=2)
+        alert("ICT BUY " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
     // One shot per sweep
     bullBar := na
 
 // Short
 shortSignal = false
-if not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)
+bearTrig = isIC ? (not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)) : bearChTrig
+if bearTrig
     entry = close
     sl    = bearExt + slBuf * atr
     risk  = sl - entry
     liqTp = nearestBelow(liqLows, entry)
     tp    = tpMode == "RR fixe" ? entry - risk * rrFixed : (not na(liqTp) and (entry - liqTp) >= minRR * risk ? liqTp : na)
-    if flat and inKillzone and biasBear and bearDel and risk > 0 and not na(tp)
+    if flat and inKillzone and biasBear and bearDel and dxyBearOk and risk > 0 and not na(tp)
         shortSignal := true
         strategy.entry("Short", strategy.short)
         strategy.exit("XS", "Short", stop=sl, limit=tp)
-        line.new(bar_index, tp, bar_index + 15, tp, color=color.green, width=2)
-        line.new(bar_index, sl, bar_index + 15, sl, color=color.red, width=2)
-        alert("ICT SHORT " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
+        label.new(bar_index, high, "SELL\n" + str.tostring(entry, format.mintick) + (useDxy ? "\nDXY ✔" : ""), style=label.style_label_down, yloc=yloc.abovebar, color=#D50000, textcolor=color.white, size=size.normal)
+        line.new(bar_index, tp, bar_index + 15, tp, color=#00E676, width=2)
+        line.new(bar_index, sl, bar_index + 15, sl, color=#FF5252, width=2)
+        alert("ICT SELL " + syminfo.ticker + " | entrée " + str.tostring(entry, format.mintick) + " SL " + str.tostring(sl, format.mintick) + " TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
     bearBar := na
 
 // Expire stale sweeps
-if not na(bullBar) and bar_index - bullBar > sweepWin
+bullRef = not isIC and not na(bullChochBar) ? bullChochBar : bullBar
+bullLim = not isIC and not na(bullChochBar) ? retestWin : sweepWin
+if not na(bullBar) and bar_index - bullRef > bullLim
     bullBar := na
-if not na(bearBar) and bar_index - bearBar > sweepWin
+bearRef = not isIC and not na(bearChochBar) ? bearChochBar : bearBar
+bearLim = not isIC and not na(bearChochBar) ? retestWin : sweepWin
+if not na(bearBar) and bar_index - bearRef > bearLim
     bearBar := na
-
-plotshape(longSignal,  "Long",  shape.triangleup,   location.belowbar, color.green, size=size.small)
-plotshape(shortSignal, "Short", shape.triangledown, location.abovebar, color.red,   size=size.small)

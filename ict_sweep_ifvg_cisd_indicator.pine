@@ -1,5 +1,5 @@
 //@version=5
-// ICT model: Liquidity Sweep → HTF Delivery → iFVG (1m) → CISD
+// ICT model: Liquidity Sweep → HTF Delivery → CHoCH + FVG retest (or iFVG + CISD) on 1m
 // Built for 1m charts (XAUUSD, BTC, ETH). Times are New York time.
 indicator(
      title            = "ICT Sweep → iFVG + CISD Indicateur + DXY (25-11-2026)",
@@ -51,6 +51,10 @@ rangeLen  = input.int(20, "Barres du dealing range", minval=2, group=G_DEL)
 showHtfFvg= input.bool(true, "Afficher les FVG HTF", group=G_DEL)
 
 G_CONF    = "5. Confirmation 1m"
+confMode  = input.string("CHoCH + FVG", "Modèle de confirmation", options=["CHoCH + FVG", "iFVG + CISD"], group=G_CONF)
+chochLen  = input.int(3, "Swing pour le CHoCH (longueur)", minval=1, group=G_CONF)
+entryMode = input.string("Retest du FVG", "Entrée (CHoCH + FVG)", options=["Retest du FVG", "Clôture du CHoCH"], group=G_CONF)
+retestWin = input.int(30, "Barres max pour le retest du FVG", minval=1, group=G_CONF)
 reqIfvg   = input.bool(true, "Exiger iFVG", group=G_CONF)
 reqCisd   = input.bool(true, "Exiger CISD", group=G_CONF)
 minFvgAtr = input.float(0.25, "Taille min FVG (x ATR)", minval=0, step=0.05, group=G_CONF)
@@ -72,6 +76,8 @@ dxyTF     = input.timeframe("60", "Timeframe DXY", group=G_DXY)
 dxyPivLen = input.int(5, "Longueur swing support/résistance", minval=2, group=G_DXY)
 dxyMaxAge = input.int(24, "Cassure valide pendant N bougies DXY (0 = illimité)", minval=0, group=G_DXY)
 showDxy   = input.bool(true, "Afficher le statut DXY", group=G_DXY)
+
+isIC = confMode == "iFVG + CISD"
 
 // ─── COMMON ───────────────────────────────────────────────────────────────────
 TZ  = "America/New_York"
@@ -289,7 +295,25 @@ if array.size(liqHighs) > 0
                 bearSweepNow := true
             array.remove(liqHighs, i)
 
+// Internal swings (CHoCH reference)
+iph = ta.pivothigh(high, chochLen, chochLen)
+ipl = ta.pivotlow(low, chochLen, chochLen)
+var float lastSwH = na
+var float lastSwL = na
+if not na(iph)
+    lastSwH := iph
+if not na(ipl)
+    lastSwL := ipl
+
 // Sweep state
+var float bullChoch    = na
+var int   bullChochBar = na
+var float bullFvgT     = na
+var float bullFvgB     = na
+var float bearChoch    = na
+var int   bearChochBar = na
+var float bearFvgT     = na
+var float bearFvgB     = na
 var float bullExt  = na
 var int   bullBar  = na
 var bool  bullDel  = false
@@ -313,6 +337,11 @@ if bullSweepNow or (not na(bullBar) and low < bullExt)
     bullCisd    := cisdLevelBull()
     bullIfvgBar := na
     bullCisdBar := na
+    if bullSweepNow
+        bullChoch := lastSwH
+    bullChochBar := na
+    bullFvgT     := na
+    bullFvgB     := na
 
 if bearSweepNow or (not na(bearBar) and high > bearExt)
     if bearSweepNow and na(bearBar)
@@ -323,6 +352,11 @@ if bearSweepNow or (not na(bearBar) and high > bearExt)
     bearCisd    := cisdLevelBear()
     bearIfvgBar := na
     bearCisdBar := na
+    if bearSweepNow
+        bearChoch := lastSwL
+    bearChochBar := na
+    bearFvgT     := na
+    bearFvgB     := na
 
 // HTF FVG invalidation (after delivery check) + extend boxes
 if array.size(hBullTop) > 0
@@ -372,7 +406,8 @@ if array.size(bearFTop) > 0
         else if close > top
             if not na(bullBar) and fb >= bullBar - preSweep and na(bullIfvgBar)
                 bullIfvgBar := bar_index
-                box.new(fb, top, bar_index, array.get(bearFBot, i), border_color=color.new(#00E676, 20), bgcolor=color.new(#00E676, 80), text="iFVG", text_size=size.tiny, text_color=#00E676)
+                if isIC
+                    box.new(fb, top, bar_index, array.get(bearFBot, i), border_color=color.new(#00E676, 20), bgcolor=color.new(#00E676, 80), text="iFVG", text_size=size.tiny, text_color=#00E676)
             array.remove(bearFTop, i)
             array.remove(bearFBot, i)
             array.remove(bearFBar, i)
@@ -389,20 +424,73 @@ if array.size(bullFTop) > 0
         else if close < bot
             if not na(bearBar) and fb >= bearBar - preSweep and na(bearIfvgBar)
                 bearIfvgBar := bar_index
-                box.new(fb, array.get(bullFTop, i), bar_index, bot, border_color=color.new(#FF5252, 20), bgcolor=color.new(#FF5252, 80), text="iFVG", text_size=size.tiny, text_color=#FF5252)
+                if isIC
+                    box.new(fb, array.get(bullFTop, i), bar_index, bot, border_color=color.new(#FF5252, 20), bgcolor=color.new(#FF5252, 80), text="iFVG", text_size=size.tiny, text_color=#FF5252)
             array.remove(bullFTop, i)
             array.remove(bullFBot, i)
             array.remove(bullFBar, i)
 
 // ─── 5b. CISD ─────────────────────────────────────────────────────────────────
-if not na(bullBar) and na(bullCisdBar) and not na(bullCisd) and close > bullCisd
+if isIC and not na(bullBar) and na(bullCisdBar) and not na(bullCisd) and close > bullCisd
     bullCisdBar := bar_index
     line.new(bullBar, bullCisd, bar_index, bullCisd, color=#00E676, style=line.style_dashed)
     label.new(bar_index, bullCisd, "CISD", style=label.style_label_left, color=color.new(#00E676, 100), textcolor=#00E676, size=size.tiny)
-if not na(bearBar) and na(bearCisdBar) and not na(bearCisd) and close < bearCisd
+if isIC and not na(bearBar) and na(bearCisdBar) and not na(bearCisd) and close < bearCisd
     bearCisdBar := bar_index
     line.new(bearBar, bearCisd, bar_index, bearCisd, color=#FF5252, style=line.style_dashed)
     label.new(bar_index, bearCisd, "CISD", style=label.style_label_left, color=color.new(#FF5252, 100), textcolor=#FF5252, size=size.tiny)
+
+// ─── 5c. CHoCH + FVG ──────────────────────────────────────────────────────────
+// FVG left by the displacement leg after the sweep (up to the CHoCH candle)
+if not isIC and not na(bullBar) and na(bullChochBar) and low > high[2] and (low - high[2]) >= minFvgAtr * atr and bar_index - 1 >= bullBar
+    bullFvgT := low
+    bullFvgB := high[2]
+if not isIC and not na(bearBar) and na(bearChochBar) and high < low[2] and (low[2] - high) >= minFvgAtr * atr and bar_index - 1 >= bearBar
+    bearFvgT := low[2]
+    bearFvgB := high
+
+// CHoCH: close beyond the last internal swing before the sweep
+if not isIC and not na(bullBar) and na(bullChochBar) and not na(bullChoch) and close > bullChoch
+    bullChochBar := bar_index
+    line.new(bullBar, bullChoch, bar_index, bullChoch, color=#00E676, width=1)
+    label.new(bar_index, bullChoch, "CHoCH", style=label.style_label_left, color=color.new(#00E676, 100), textcolor=#00E676, size=size.tiny)
+    if not na(bullFvgT)
+        box.new(bar_index, bullFvgT, bar_index + 10, bullFvgB, border_color=color.new(#00E676, 20), bgcolor=color.new(#00E676, 80), text="FVG", text_size=size.tiny, text_color=#00E676)
+if not isIC and not na(bearBar) and na(bearChochBar) and not na(bearChoch) and close < bearChoch
+    bearChochBar := bar_index
+    line.new(bearBar, bearChoch, bar_index, bearChoch, color=#FF5252, width=1)
+    label.new(bar_index, bearChoch, "CHoCH", style=label.style_label_left, color=color.new(#FF5252, 100), textcolor=#FF5252, size=size.tiny)
+    if not na(bearFvgT)
+        box.new(bar_index, bearFvgT, bar_index + 10, bearFvgB, border_color=color.new(#FF5252, 20), bgcolor=color.new(#FF5252, 80), text="FVG", text_size=size.tiny, text_color=#FF5252)
+
+// Entry trigger: retest of the FVG (or CHoCH close in aggressive mode)
+bullChTrig  = false
+bullChEntry = float(na)
+if not isIC and not na(bullBar) and not na(bullChochBar) and not na(bullFvgT)
+    if entryMode == "Clôture du CHoCH"
+        if bar_index == bullChochBar
+            bullChTrig  := true
+            bullChEntry := close
+    else if bar_index > bullChochBar
+        if close < bullFvgB
+            bullBar := na
+        else if low <= bullFvgT
+            bullChTrig  := true
+            bullChEntry := math.min(open, bullFvgT)
+
+bearChTrig  = false
+bearChEntry = float(na)
+if not isIC and not na(bearBar) and not na(bearChochBar) and not na(bearFvgT)
+    if entryMode == "Clôture du CHoCH"
+        if bar_index == bearChochBar
+            bearChTrig  := true
+            bearChEntry := close
+    else if bar_index > bearChochBar
+        if close > bearFvgT
+            bearBar := na
+        else if high >= bearFvgB
+            bearChTrig  := true
+            bearChEntry := math.max(open, bearFvgB)
 
 // ─── SETUP EVALUATION ─────────────────────────────────────────────────────────
 confirmed(int ifvgBar, int cisdBar) =>
@@ -457,8 +545,9 @@ flat = tradeDir == 0
 
 // Long
 longSignal = false
-if not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)
-    entry = close
+bullTrig = isIC ? (not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)) : bullChTrig
+if bullTrig
+    entry = isIC ? close : bullChEntry
     sl    = bullExt - slBuf * atr
     risk  = entry - sl
     liqTp = nearestAbove(liqHighs, entry)
@@ -477,8 +566,9 @@ if not na(bullBar) and confirmed(bullIfvgBar, bullCisdBar)
 
 // Short
 shortSignal = false
-if not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)
-    entry = close
+bearTrig = isIC ? (not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)) : bearChTrig
+if bearTrig
+    entry = isIC ? close : bearChEntry
     sl    = bearExt + slBuf * atr
     risk  = sl - entry
     liqTp = nearestBelow(liqLows, entry)
@@ -495,9 +585,13 @@ if not na(bearBar) and confirmed(bearIfvgBar, bearCisdBar)
     bearBar := na
 
 // Expire stale sweeps
-if not na(bullBar) and bar_index - bullBar > sweepWin
+bullRef = not isIC and not na(bullChochBar) ? bullChochBar : bullBar
+bullLim = not isIC and not na(bullChochBar) ? retestWin : sweepWin
+if not na(bullBar) and bar_index - bullRef > bullLim
     bullBar := na
-if not na(bearBar) and bar_index - bearBar > sweepWin
+bearRef = not isIC and not na(bearChochBar) ? bearChochBar : bearBar
+bearLim = not isIC and not na(bearChochBar) ? retestWin : sweepWin
+if not na(bearBar) and bar_index - bearRef > bearLim
     bearBar := na
 
 

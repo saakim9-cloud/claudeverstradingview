@@ -7,6 +7,8 @@ strategy("XAU Range Breakout — Close Confirm + Volume [Akim]", "XAU RB-CC VOL"
 // >= threshold x its 20-bar average (high-volume breakouts were ~break-even in the Jun-Nov 2026 M15 test
 // and in the Jan-May 2026 M30 out-of-sample check). The day is then skipped (one shot per day).
 // OANDA volume is tick volume; futures (e.g. COMEX_MINI:MGC1!) use real exchange volume.
+// By default the filter reads the MGC1! volume of the same 15m bar, so a CFD chart uses real futures volume.
+// If that bar has no MGC1! data, the breakout is not filtered.
 // Works on CFD/spot (1 unit = 1 oz) and on futures: size uses syminfo.pointvalue (MGC = 10 oz per contract).
 
 // ===== Inputs =====
@@ -20,6 +22,8 @@ maxR      = input.float(1.0, "Range max x daily ATR", step = 0.05)
 useVol    = input.bool(true, "Skip high-volume breakouts", group = "Volume filter")
 volLen    = input.int(20, "Volume average length", minval = 2, group = "Volume filter")
 volMax    = input.float(1.5, "Skip if breakout volume >= x average", step = 0.1, group = "Volume filter")
+useExtVol = input.bool(true, "Read volume from another symbol (real futures volume)", group = "Volume filter")
+volSym    = input.symbol("COMEX_MINI:MGC1!", "Volume symbol", group = "Volume filter")
 accCap    = input.float(10000, "YOUR account capital (lot / contract calc)", step = 500)
 showLbl   = input.bool(true, "Show labels")
 tz        = "America/New_York"
@@ -45,9 +49,13 @@ exitBar = hour(time_close, tz) == exitHour and minute(time_close, tz) == 0
 atrD    = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
 rangeOk = not useAtr or ((rh - rl) >= minR * atrD and (rh - rl) <= maxR * atrD)
 
-// ===== Relative volume of the current bar =====
-float volAvg = ta.sma(volume, volLen)
-float rvol   = volAvg > 0 ? volume / volAvg : na
+// ===== Relative volume of the current bar (chart volume, or MGC1! real volume on the same timeframe) =====
+relVol() =>
+    float a = ta.sma(volume, volLen)
+    a > 0 ? volume / a : na
+float rvolChart = relVol()
+float rvolExt   = request.security(volSym, timeframe.period, relVol(), gaps = barmerge.gaps_on)
+float rvol      = useExtVol ? rvolExt : rvolChart
 bool  volOk  = not useVol or na(rvol) or rvol < volMax
 
 // ===== Daily state =====

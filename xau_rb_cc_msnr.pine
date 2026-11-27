@@ -6,6 +6,7 @@ strategy("XAU Range Breakout CC + MSNR [Akim]", "XAU RB-CC MSNR", overlay = true
 // MSNR add-ons (each can be switched on/off):
 //   1. "No room" filter: skip the breakout when a fresh MSNR level (H4/H1 A/V) sits in front of the entry
 //      closer than X R in the trade direction.
+//      Invert option: trade ONLY when such a level is close (level acts as a magnet).
 //   2. MSNR take profit: target = first fresh opposite MSNR level at least Y R away (time exit kept).
 // A-level (resistance) = bullish candle then bearish candle, at the bullish close.
 // V-level (support)    = bearish candle then bullish candle, at the bearish close.
@@ -32,6 +33,7 @@ useFilt  = input.bool(true, "1. No-room filter", group = G_M)
 filtR    = input.float(0.5, "   Block if level closer than (x R)", minval = 0.05, step = 0.05, group = G_M)
 useTp    = input.bool(false, "2. Take profit on next MSNR level", group = G_M)
 tpMinR   = input.float(1.0, "   Min distance of TP level (x R)", minval = 0.1, step = 0.1, group = G_M)
+invF     = input.bool(false, "   Invert: trade ONLY when a level is close in front", group = G_M)
 showMsnr = input.bool(true, "Show MSNR levels", group = G_M)
 tz       = "America/New_York"
 
@@ -152,8 +154,10 @@ bool brkShort = canTrade and close < rl
 float risk = close * slPct
 float obstL = nearestAbove(close)
 float obstS = nearestBelow(close)
-bool blockL = useFilt and not na(obstL) and obstL - close < filtR * risk
-bool blockS = useFilt and not na(obstS) and close - obstS < filtR * risk
+bool nearL  = not na(obstL) and obstL - close < filtR * risk
+bool nearS  = not na(obstS) and close - obstS < filtR * risk
+bool blockL = useFilt and (invF ? not nearL : nearL)
+bool blockS = useFilt and (invF ? not nearS : nearS)
 
 bool goLong  = brkLong and not blockL
 bool goShort = brkShort and not blockS
@@ -193,7 +197,7 @@ if showLbl and goLong
 if showLbl and goShort
     label.new(bar_index, high, "SELL " + str.tostring(close, format.mintick) + "\nSL " + str.tostring(close * (1 + slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##"), color = color.new(color.red, 10), textcolor = color.white, style = label.style_label_down, size = size.small)
 if showLbl and ((brkLong and blockL) or (brkShort and blockS))
-    label.new(bar_index, brkLong ? low : high, "SKIP: MSNR level in front", color = color.new(color.gray, 20), textcolor = color.white, style = brkLong ? label.style_label_up : label.style_label_down, size = size.tiny)
+    label.new(bar_index, brkLong ? low : high, invF ? "SKIP: no MSNR level near" : "SKIP: MSNR level in front", color = color.new(color.gray, 20), textcolor = color.white, style = brkLong ? label.style_label_up : label.style_label_down, size = size.tiny)
 
 if goLong
     alert("XAUUSD BUY now " + str.tostring(close, format.mintick) + " | SL " + str.tostring(close * (1 - slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##"), alert.freq_once_per_bar_close)

@@ -1,5 +1,5 @@
 //@version=6
-strategy("XAU Range Breakout — Close Confirm + Volume [Akim]", "XAU RB-CC VOL", overlay = true, initial_capital = 100000, commission_type = strategy.commission.percent, commission_value = 0.004, slippage = 2, max_labels_count = 500)
+strategy("XAU Range Breakout — Close Confirm + Volume [Akim] kimo", "XAU RB-CC VOL kimo", overlay = true, initial_capital = 100000, commission_type = strategy.commission.percent, commission_value = 0.004, slippage = 2, max_labels_count = 500)
 
 // Range 02:00-05:00 Paris (= 20:00-23:00 New York, DST handled), entry on the first 15m close outside the range,
 // SL 1% from the signal close, time exit at 18:00 Paris, one trade per day, daily ATR range-size filter.

@@ -1,0 +1,118 @@
+//@version=6
+strategy("XAU Range Breakout — Close Confirm + Volume [Akim]", "XAU RB-CC VOL", overlay = true, initial_capital = 100000, commission_type = strategy.commission.percent, commission_value = 0.004, slippage = 2, max_labels_count = 500)
+
+// Range 02:00-05:00 Paris (= 20:00-23:00 New York, DST handled), entry on the first 15m close outside the range,
+// SL 1% from the signal close, time exit at 18:00 Paris, one trade per day, daily ATR range-size filter.
+// Volume filter (optional, on by default): skip the breakout when the breakout candle's volume is
+// >= threshold x its 20-bar average (high-volume breakouts were ~break-even in the Jun-Nov 2026 M15 test
+// and in the Jan-May 2026 M30 out-of-sample check). The day is then skipped (one shot per day).
+// OANDA volume is tick volume.
+
+// ===== Inputs =====
+rangeSess = input.session("2000-2300", "Range (New York time) = 02:00-05:00 Paris")
+exitHour  = input.int(12, "Exit hour New York (= 18:00 Paris)", minval = 0, maxval = 23)
+slPct     = input.float(1.0, "Stop loss %", step = 0.1) / 100
+riskPct   = input.float(0.5, "Risk per trade %", step = 0.1) / 100
+useAtr    = input.bool(true, "Range size filter (daily ATR)")
+minR      = input.float(0.2, "Range min x daily ATR", step = 0.05)
+maxR      = input.float(1.0, "Range max x daily ATR", step = 0.05)
+useVol    = input.bool(true, "Skip high-volume breakouts", group = "Volume filter")
+volLen    = input.int(20, "Volume average length", minval = 2, group = "Volume filter")
+volMax    = input.float(1.5, "Skip if breakout volume >= x average", step = 0.1, group = "Volume filter")
+accCap    = input.float(10000, "YOUR account capital (lot calc)", step = 500)
+showLbl   = input.bool(true, "Show labels")
+tz        = "America/New_York"
+
+// ===== Range =====
+inR = not na(time(timeframe.period, rangeSess, tz))
+var float rh = na
+var float rl = na
+if inR and not inR[1]
+    rh := high
+    rl := low
+else if inR
+    rh := math.max(rh, high)
+    rl := math.min(rl, low)
+rangeEnd = not inR and inR[1]
+
+// Bar whose CLOSE is exactly at the exit hour -> market close fills at the 18:00 Paris open
+exitBar = hour(time_close, tz) == exitHour and minute(time_close, tz) == 0
+
+// ===== Daily ATR filter (previous closed day, no repaint) =====
+atrD    = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+rangeOk = not useAtr or ((rh - rl) >= minR * atrD and (rh - rl) <= maxR * atrD)
+
+// ===== Relative volume of the current bar =====
+float volAvg = ta.sma(volume, volLen)
+float rvol   = volAvg > 0 ? volume / volAvg : na
+bool  volOk  = not useVol or na(rvol) or rvol < volMax
+
+// ===== Daily state =====
+var bool active = false
+var bool dayOk  = false
+var bool traded = false
+if rangeEnd
+    active := true
+    dayOk  := rangeOk
+    traded := false
+
+// ===== Entry on close outside the range (SL attached on the same bar) =====
+bool canTrade = active and dayOk and not traded and strategy.position_size == 0 and not exitBar and barstate.isconfirmed
+bool brkLong  = canTrade and close > rh
+bool brkShort = canTrade and close < rl
+bool goLong   = brkLong and volOk
+bool goShort  = brkShort and volOk
+bool skipped  = (brkLong or brkShort) and not volOk
+
+if goLong
+    float sl  = close * (1 - slPct)
+    float qty = strategy.equity * riskPct / (close - sl)
+    strategy.entry("L", strategy.long, qty = qty)
+    strategy.exit("XL", "L", stop = sl)
+if goShort
+    float sl  = close * (1 + slPct)
+    float qty = strategy.equity * riskPct / (sl - close)
+    strategy.entry("S", strategy.short, qty = qty)
+    strategy.exit("XS", "S", stop = sl)
+if brkLong or brkShort
+    traded := true
+
+// ===== Time exit 18:00 Paris =====
+if exitBar
+    strategy.close_all(comment = "Time exit 18h")
+    active := false
+
+// ===== Lot for YOUR account (1 lot = 100 oz) =====
+float lotNow = accCap * riskPct / (close * slPct) / 100
+
+// ===== Visuals =====
+bool showLv = (active and dayOk) or inR
+plot(showLv ? rh : na, "Range High (BUY above close)", color.new(color.lime, 0), 2, plot.style_linebr)
+plot(showLv ? rl : na, "Range Low (SELL below close)", color.new(color.red, 0), 2, plot.style_linebr)
+bgcolor(inR ? color.new(color.blue, 90) : na)
+plot(strategy.position_size > 0 ? strategy.position_avg_price * (1 - slPct) : na, "Long SL", color.new(color.lime, 50), 1, plot.style_linebr)
+plot(strategy.position_size < 0 ? strategy.position_avg_price * (1 + slPct) : na, "Short SL", color.new(color.red, 50), 1, plot.style_linebr)
+
+if showLbl and rangeEnd
+    if rangeOk
+        label.new(bar_index, rh, "RANGE OK\nBUY if 15m close > " + str.tostring(rh, format.mintick) + "\nSELL if 15m close < " + str.tostring(rl, format.mintick), color = color.new(color.gray, 20), textcolor = color.white, style = label.style_label_down, size = size.small)
+    else
+        label.new(bar_index, rh, "NO TRADE\n(range outside ATR filter)", color = color.new(color.gray, 20), textcolor = color.white, style = label.style_label_down, size = size.small)
+if showLbl and goLong
+    label.new(bar_index, low, "BUY " + str.tostring(close, format.mintick) + "\nSL " + str.tostring(close * (1 - slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##"), color = color.new(color.lime, 10), textcolor = color.black, style = label.style_label_up, size = size.small)
+if showLbl and goShort
+    label.new(bar_index, high, "SELL " + str.tostring(close, format.mintick) + "\nSL " + str.tostring(close * (1 + slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##"), color = color.new(color.red, 10), textcolor = color.white, style = label.style_label_down, size = size.small)
+if showLbl and skipped
+    label.new(bar_index, brkLong ? low : high, "SKIP: high volume (" + str.tostring(rvol, "0.0") + "x)\nno trade today", color = color.new(color.orange, 20), textcolor = color.white, style = brkLong ? label.style_label_up : label.style_label_down, size = size.small)
+
+// ===== Alerts (create one alert: "Any alert() function call") =====
+if rangeEnd
+    alert(rangeOk ? "XAUUSD range done | BUY if 15m close > " + str.tostring(rh, format.mintick) + " | SELL if 15m close < " + str.tostring(rl, format.mintick) + " | exit 18:00 Paris" : "XAUUSD: no trade today (range outside ATR filter)", alert.freq_once_per_bar_close)
+if goLong
+    alert("XAUUSD BUY now " + str.tostring(close, format.mintick) + " | SL " + str.tostring(close * (1 - slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##") + " | exit 18:00 Paris", alert.freq_once_per_bar_close)
+if goShort
+    alert("XAUUSD SELL now " + str.tostring(close, format.mintick) + " | SL " + str.tostring(close * (1 + slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##") + " | exit 18:00 Paris", alert.freq_once_per_bar_close)
+if skipped
+    alert("XAUUSD breakout skipped: high volume (" + str.tostring(rvol, "0.0") + "x average) - no trade today", alert.freq_once_per_bar_close)
+if exitBar and strategy.position_size != 0
+    alert("XAUUSD: close the position now (18:00 Paris time exit)", alert.freq_once_per_bar_close)

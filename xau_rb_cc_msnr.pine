@@ -1,0 +1,205 @@
+//@version=6
+strategy("XAU Range Breakout CC + MSNR [Akim]", "XAU RB-CC MSNR", overlay = true, initial_capital = 100000, commission_type = strategy.commission.percent, commission_value = 0.004, slippage = 2, max_labels_count = 500, max_lines_count = 500)
+
+// Base: XAU RB-CC (Asia range 02:00-05:00 Paris = 20:00-23:00 NY, first 15m close outside the range,
+// SL 1%, time exit 18:00 Paris, one trade per day, daily ATR range filter).
+// MSNR add-ons (each can be switched on/off):
+//   1. "No room" filter: skip the breakout when a fresh MSNR level (H4/H1 A/V) sits in front of the entry
+//      closer than X R in the trade direction.
+//   2. MSNR take profit: target = first fresh opposite MSNR level at least Y R away (time exit kept).
+// A-level (resistance) = bullish candle then bearish candle, at the bullish close.
+// V-level (support)    = bearish candle then bullish candle, at the bearish close.
+// A level is removed when a chart-TF body closes through it.
+
+// ===== Inputs =====
+rangeSess = input.session("2000-2300", "Range (New York time) = 02:00-05:00 Paris")
+exitHour  = input.int(12, "Exit hour New York (= 18:00 Paris)", minval = 0, maxval = 23)
+slPct     = input.float(1.0, "Stop loss %", step = 0.1) / 100
+riskPct   = input.float(0.5, "Risk per trade %", step = 0.1) / 100
+useAtr    = input.bool(true, "Range size filter (daily ATR)")
+minR      = input.float(0.2, "Range min x daily ATR", step = 0.05)
+maxR      = input.float(1.0, "Range max x daily ATR", step = 0.05)
+accCap    = input.float(10000, "YOUR account capital (lot calc)", step = 500)
+showLbl   = input.bool(true, "Show labels")
+
+G_M      = "MSNR"
+tf1On    = input.bool(true, "MSNR TF 1", inline = "t1", group = G_M)
+tf1      = input.timeframe("240", "", inline = "t1", group = G_M)
+tf2On    = input.bool(true, "MSNR TF 2", inline = "t2", group = G_M)
+tf2      = input.timeframe("60", "", inline = "t2", group = G_M)
+maxLv    = input.int(10, "Max levels kept per side", minval = 1, maxval = 50, group = G_M)
+useFilt  = input.bool(true, "1. No-room filter", group = G_M)
+filtR    = input.float(0.5, "   Block if level closer than (x R)", minval = 0.05, step = 0.05, group = G_M)
+useTp    = input.bool(false, "2. Take profit on next MSNR level", group = G_M)
+tpMinR   = input.float(1.0, "   Min distance of TP level (x R)", minval = 0.1, step = 0.1, group = G_M)
+showMsnr = input.bool(true, "Show MSNR levels", group = G_M)
+tz       = "America/New_York"
+
+// ===== MSNR levels =====
+msnr() =>
+    bool isA = close[2] > open[2] and close[1] < open[1]
+    bool isV = close[2] < open[2] and close[1] > open[1]
+    [isA, isV, close[2], time]
+
+[a1, v1, p1, n1] = request.security(syminfo.tickerid, tf1, msnr(), lookahead = barmerge.lookahead_on)
+[a2, v2, p2, n2] = request.security(syminfo.tickerid, tf2, msnr(), lookahead = barmerge.lookahead_on)
+
+var array<float> res = array.new<float>()
+var array<float> sup = array.new<float>()
+var array<line>  resLn = array.new<line>()
+var array<line>  supLn = array.new<line>()
+
+addLv(array<float> arr, array<line> lns, float p, color c) =>
+    if not na(p) and not arr.includes(p)
+        arr.push(p)
+        lns.push(showMsnr ? line.new(bar_index, p, bar_index + 1, p, extend = extend.right, color = color.new(c, 55), style = line.style_dotted) : na)
+        if arr.size() > maxLv
+            arr.shift()
+            line.delete(lns.shift())
+
+ch1 = ta.change(n1)
+ch2 = ta.change(n2)
+bool new1 = tf1On and ch1 != 0
+bool new2 = tf2On and ch2 != 0
+if new1 and a1
+    addLv(res, resLn, p1, color.red)
+if new1 and v1
+    addLv(sup, supLn, p1, color.lime)
+if new2 and a2
+    addLv(res, resLn, p2, color.red)
+if new2 and v2
+    addLv(sup, supLn, p2, color.lime)
+
+// Remove levels broken by a body close
+if res.size() > 0
+    for i = res.size() - 1 to 0
+        if close > res.get(i)
+            res.remove(i)
+            line.delete(resLn.remove(i))
+if sup.size() > 0
+    for i = sup.size() - 1 to 0
+        if close < sup.get(i)
+            sup.remove(i)
+            line.delete(supLn.remove(i))
+
+// Nearest level above / below a price
+nearestAbove(float p) =>
+    float best = na
+    for x in res
+        if x > p and (na(best) or x < best)
+            best := x
+    for x in sup
+        if x > p and (na(best) or x < best)
+            best := x
+    best
+nearestBelow(float p) =>
+    float best = na
+    for x in sup
+        if x < p and (na(best) or x > best)
+            best := x
+    for x in res
+        if x < p and (na(best) or x > best)
+            best := x
+    best
+// First level at least d away
+firstAboveFrom(float p) =>
+    float best = na
+    for x in res
+        if x >= p and (na(best) or x < best)
+            best := x
+    for x in sup
+        if x >= p and (na(best) or x < best)
+            best := x
+    best
+firstBelowFrom(float p) =>
+    float best = na
+    for x in sup
+        if x <= p and (na(best) or x > best)
+            best := x
+    for x in res
+        if x <= p and (na(best) or x > best)
+            best := x
+    best
+
+// ===== Range =====
+inR = not na(time(timeframe.period, rangeSess, tz))
+var float rh = na
+var float rl = na
+if inR and not inR[1]
+    rh := high
+    rl := low
+else if inR
+    rh := math.max(rh, high)
+    rl := math.min(rl, low)
+rangeEnd = not inR and inR[1]
+exitBar = hour(time_close, tz) == exitHour and minute(time_close, tz) == 0
+
+atrD    = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+rangeOk = not useAtr or ((rh - rl) >= minR * atrD and (rh - rl) <= maxR * atrD)
+
+var bool active = false
+var bool dayOk  = false
+var bool traded = false
+if rangeEnd
+    active := true
+    dayOk  := rangeOk
+    traded := false
+
+bool canTrade = active and dayOk and not traded and strategy.position_size == 0 and not exitBar and barstate.isconfirmed
+bool brkLong  = canTrade and close > rh
+bool brkShort = canTrade and close < rl
+
+float risk = close * slPct
+float obstL = nearestAbove(close)
+float obstS = nearestBelow(close)
+bool blockL = useFilt and not na(obstL) and obstL - close < filtR * risk
+bool blockS = useFilt and not na(obstS) and close - obstS < filtR * risk
+
+bool goLong  = brkLong and not blockL
+bool goShort = brkShort and not blockS
+
+if goLong
+    float sl  = close * (1 - slPct)
+    float tp  = useTp ? firstAboveFrom(close + tpMinR * risk) : na
+    strategy.entry("L", strategy.long, qty = strategy.equity * riskPct / (close - sl))
+    strategy.exit("XL", "L", stop = sl, limit = tp)
+    traded := true
+if goShort
+    float sl  = close * (1 + slPct)
+    float tp  = useTp ? firstBelowFrom(close - tpMinR * risk) : na
+    strategy.entry("S", strategy.short, qty = strategy.equity * riskPct / (sl - close))
+    strategy.exit("XS", "S", stop = sl, limit = tp)
+    traded := true
+// A blocked breakout uses up the day (same as RB-CC: one shot per day)
+if (brkLong and blockL) or (brkShort and blockS)
+    traded := true
+
+if exitBar
+    strategy.close_all(comment = "Time exit 18h")
+    active := false
+
+float lotNow = accCap * riskPct / (close * slPct) / 100
+
+// ===== Visuals =====
+bool showLv = (active and dayOk) or inR
+plot(showLv ? rh : na, "Range High (BUY above close)", color.new(color.lime, 0), 2, plot.style_linebr)
+plot(showLv ? rl : na, "Range Low (SELL below close)", color.new(color.red, 0), 2, plot.style_linebr)
+bgcolor(inR ? color.new(color.blue, 90) : na)
+plot(strategy.position_size > 0 ? strategy.position_avg_price * (1 - slPct) : na, "Long SL", color.new(color.lime, 50), 1, plot.style_linebr)
+plot(strategy.position_size < 0 ? strategy.position_avg_price * (1 + slPct) : na, "Short SL", color.new(color.red, 50), 1, plot.style_linebr)
+
+if showLbl and goLong
+    label.new(bar_index, low, "BUY " + str.tostring(close, format.mintick) + "\nSL " + str.tostring(close * (1 - slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##"), color = color.new(color.lime, 10), textcolor = color.black, style = label.style_label_up, size = size.small)
+if showLbl and goShort
+    label.new(bar_index, high, "SELL " + str.tostring(close, format.mintick) + "\nSL " + str.tostring(close * (1 + slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##"), color = color.new(color.red, 10), textcolor = color.white, style = label.style_label_down, size = size.small)
+if showLbl and ((brkLong and blockL) or (brkShort and blockS))
+    label.new(bar_index, brkLong ? low : high, "SKIP: MSNR level in front", color = color.new(color.gray, 20), textcolor = color.white, style = brkLong ? label.style_label_up : label.style_label_down, size = size.tiny)
+
+if goLong
+    alert("XAUUSD BUY now " + str.tostring(close, format.mintick) + " | SL " + str.tostring(close * (1 - slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##"), alert.freq_once_per_bar_close)
+if goShort
+    alert("XAUUSD SELL now " + str.tostring(close, format.mintick) + " | SL " + str.tostring(close * (1 + slPct), format.mintick) + " | Lot " + str.tostring(lotNow, "#.##"), alert.freq_once_per_bar_close)
+if (brkLong and blockL) or (brkShort and blockS)
+    alert("XAUUSD breakout skipped: MSNR level in front", alert.freq_once_per_bar_close)
+if exitBar and strategy.position_size != 0
+    alert("XAUUSD: close the position now (18:00 Paris time exit)", alert.freq_once_per_bar_close)

@@ -1,0 +1,79 @@
+//@version=6
+indicator("Reversal Candles — Hammer / Star / Engulfing [Akim] kimo", "Reversal kimo", overlay = true, max_labels_count = 500)
+
+// Marks reversal candles on confirmed bars:
+//   Bullish (below the bar): Hammer, Inverted hammer, Bullish engulfing
+//   Bearish (above the bar): Shooting star, Hanging man, Bearish engulfing
+// Context filter: the candle must make the lowest low (bullish) / highest high (bearish) of the last N bars.
+// Size filter: candle range >= X x ATR, to skip tiny doji noise.
+
+// ===== Inputs =====
+G_P     = "Patterns"
+showHam = input.bool(true, "Hammer", group = G_P)
+showIH  = input.bool(true, "Inverted hammer", group = G_P)
+showBE  = input.bool(true, "Bullish engulfing", group = G_P)
+showSS  = input.bool(true, "Shooting star", group = G_P)
+showHM  = input.bool(true, "Hanging man", group = G_P)
+showSE  = input.bool(true, "Bearish engulfing", group = G_P)
+
+G_R      = "Rules"
+wickMult = input.float(2.0, "Long wick >= x body", minval = 1, step = 0.25, group = G_R)
+oppWick  = input.float(0.25, "Opposite wick <= x candle range", minval = 0, maxval = 1, step = 0.05, group = G_R)
+maxBody  = input.float(0.35, "Body <= x candle range (hammer / star)", minval = 0.05, maxval = 1, step = 0.05, group = G_R)
+useCtx   = input.bool(true, "Only at a local low / high", group = G_R)
+ctxLen   = input.int(10, "   Lookback (bars)", minval = 2, group = G_R)
+minAtr   = input.float(0.5, "Min candle range (x ATR 14)", minval = 0, step = 0.1, group = G_R)
+
+G_V      = "Display"
+showTxt  = input.bool(true, "Show pattern names", group = G_V)
+colBull  = input.color(#00C853, "Bullish", group = G_V)
+colBear  = input.color(#FF1744, "Bearish", group = G_V)
+
+// ===== Candle anatomy =====
+float body   = math.abs(close - open)
+float rng    = high - low
+float upWick = high - math.max(open, close)
+float dnWick = math.min(open, close) - low
+float atr    = ta.atr(14)
+bool  sizeOk = rng > 0 and rng >= minAtr * atr
+
+float lowN  = ta.lowest(low, ctxLen)
+float highN = ta.highest(high, ctxLen)
+bool atLow  = not useCtx or low <= lowN
+bool atHigh = not useCtx or high >= highN
+
+// Long lower wick, small body near the top (hammer / hanging man shape)
+bool hamShape = sizeOk and body <= maxBody * rng and dnWick >= wickMult * math.max(body, syminfo.mintick) and upWick <= oppWick * rng
+// Long upper wick, small body near the bottom (shooting star / inverted hammer shape)
+bool starShape = sizeOk and body <= maxBody * rng and upWick >= wickMult * math.max(body, syminfo.mintick) and dnWick <= oppWick * rng
+
+bool hammer   = showHam and hamShape and atLow
+bool invHam   = showIH and starShape and atLow
+bool hanging  = showHM and hamShape and atHigh
+bool star     = showSS and starShape and atHigh
+
+bool bullEng = showBE and sizeOk and atLow and close[1] < open[1] and close > open and close >= open[1] and open <= close[1] and body > math.abs(close[1] - open[1])
+bool bearEng = showSE and sizeOk and atHigh and close[1] > open[1] and close < open and close <= open[1] and open >= close[1] and body > math.abs(close[1] - open[1])
+
+bool bullSig = barstate.isconfirmed and (hammer or invHam or bullEng)
+bool bearSig = barstate.isconfirmed and (star or hanging or bearEng)
+
+string bullTxt = hammer ? "Hammer" : bullEng ? "Bull engulf" : invHam ? "Inv hammer" : ""
+string bearTxt = star ? "Shooting star" : bearEng ? "Bear engulf" : hanging ? "Hanging man" : ""
+
+// ===== Drawing =====
+plotshape(bullSig, "Bullish reversal", shape.triangleup, location.belowbar, colBull, size = size.small)
+plotshape(bearSig, "Bearish reversal", shape.triangledown, location.abovebar, colBear, size = size.small)
+if showTxt and bullSig
+    label.new(bar_index, low, bullTxt, yloc = yloc.belowbar, style = label.style_none, textcolor = colBull, size = size.small)
+if showTxt and bearSig
+    label.new(bar_index, high, bearTxt, yloc = yloc.abovebar, style = label.style_none, textcolor = colBear, size = size.small)
+barcolor(bullSig ? colBull : bearSig ? colBear : na, title = "Highlight reversal candles")
+
+// ===== Alerts =====
+alertcondition(bullSig, "Bullish reversal candle", "{{ticker}} bullish reversal candle (hammer / inverted hammer / engulfing)")
+alertcondition(bearSig, "Bearish reversal candle", "{{ticker}} bearish reversal candle (shooting star / hanging man / engulfing)")
+if bullSig
+    alert(syminfo.ticker + " " + timeframe.period + "m: " + bullTxt + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if bearSig
+    alert(syminfo.ticker + " " + timeframe.period + "m: " + bearTxt + " at " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
